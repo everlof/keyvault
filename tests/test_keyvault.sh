@@ -32,7 +32,7 @@ check_true() { if "$@"; then ok "$1"; else no "$1"; fi; } # unused guard, kept e
 # ---------------------------------------------------------------------------- fixture
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/keyvault-test.XXXXXX")"
-trap 'rm -rf "$WORK"; [[ -n ${MOUNT:-} ]] && rm -rf "$MOUNT" 2>/dev/null; true' EXIT
+trap '[[ -n ${IKC:-} ]] && security delete-keychain "$IKC" 2>/dev/null; rm -rf "$WORK"; [[ -n ${MOUNT:-} ]] && rm -rf "$MOUNT" 2>/dev/null; true' EXIT
 
 mkdir -p "$WORK/src" "$WORK/globdir" "$WORK/dest" "$WORK/state"
 
@@ -702,38 +702,64 @@ check "revoke --all leaves nothing on loan" "$(ls "$A/state/grants" | wc -l | tr
 
 # ---------------------------------------------------------------------------- keychain identities
 #
-# A fake `security` stands in for the keychain and counts exports: each real one costs a
-# macOS prompt per private key, and "Always Allow" does not stick for exports.
+# A throwaway keychain holds three identities. They are self-signed,
+# so the real `security find-identity -v` would call none of them valid: a fake one says
+# which are, and hands everything else to the real tool. Exports are counted: each real
+# one costs a macOS prompt per private key, and "Always Allow" does not stick for exports.
 
 I="$WORK/ident"
 mkdir -p "$I/bin" "$I/dest" "$I/state" "$I/keys"
+IKC="$I/test.keychain-db"      # not under a Library/Keychains: there, export wants the password
+security create-keychain -p test "$IKC" && security unlock-keychain -p test "$IKC" && security set-keychain-settings "$IKC"
+for n in one two three; do
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$I/$n.key" -out "$I/$n.crt" -days 30 -subj "/CN=keyvault-test-$n" 2>/dev/null
+    openssl pkcs12 -export -legacy -inkey "$I/$n.key" -in "$I/$n.crt" -out "$I/$n.p12" -passout pass:x 2>/dev/null \
+        || openssl pkcs12 -export -inkey "$I/$n.key" -in "$I/$n.crt" -out "$I/$n.p12" -passout pass:x
+    security import "$I/$n.p12" -k "$IKC" -P x -A >/dev/null     # -A: no prompt, it is a test keychain
+done
+sha1_of() { openssl x509 -in "$1" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g'; }
+valid() { local n i=0; for n in "$@"; do i=$((i + 1)); printf '  %d) %s "Apple Development: keyvault-test-%s (ABCDE12345)"\n' "$i" "$(sha1_of "$I/$n.crt")" "$n"; done
+          printf '     %d valid identities found\n' "$i"; }
+valid one two > "$I/identities"      # three stands for an expired one: in the keychain, not valid
 cat > "$I/bin/security" <<'EOF'
 #!/bin/bash
 case "$1" in
     find-identity) cat "$FAKE_SEC/identities" ;;
     find-certificate) exit 0 ;;
-    export) out=""; while (($#)); do [[ $1 == -o ]] && out="$2"; shift; done
-            echo x >> "$FAKE_SEC/exports"; printf 'FAKE P12\n' > "$out" ;;
-    *) exit 1 ;;
+    export) echo x >> "$FAKE_SEC/exports"; exec /usr/bin/security "$@" ;;
+    *) exec /usr/bin/security "$@" ;;
 esac
 EOF
-chmod +x "$I/bin/security"
-printf '  1) %s "Developer ID Application: Test (ABCDE12345)"\n  2) %s "Apple Distribution: Test (ABCDE12345)"\n     2 valid identities found\n' \
-    0123456789ABCDEF0123456789ABCDEF01234567 89ABCDEF0123456789ABCDEF0123456789ABCDEF > "$I/identities"
+cat > "$I/bin/python3" <<EOF
+#!/bin/bash
+[[ \${1:-} == - ]] && echo x >> "\$FAKE_SEC/exports"      # export_identities is the only 'python3 -' here
+exec "$(command -v python3)" "\$@"
+EOF
+chmod +x "$I/bin/security" "$I/bin/python3"
 : > "$I/exports"
 # A key whose password is lost: openssl would ask for it on the terminal.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -aes-256-cbc -pass pass:gone -out "$I/keys/locked.pem" 2>/dev/null
 printf 'PRIVATE-KEY-GAMMA\n' > "$I/keys/gamma.key"
 chmod 600 "$I/keys"/*
 cat > "$I/keyvault.conf" <<EOF
-identities test.keychain-db --level both --desc "signing identities"
+identities "$IKC" --level both --desc "signing identities"
 file "$I/keys/gamma.key" --id gamma --level both
 file "$I/keys/locked.pem" --id locked
 EOF
-ienv() { env PATH="$I/bin:$PATH" FAKE_SEC="$I" KEYVAULT_CONF="$I/keyvault.conf" KEYVAULT_DEST="$I/dest" \
+ienv() { env PATH="$I/bin:$PATH" FAKE_SEC="$I" KEYVAULT_KEYCHAIN_NO_UI=1 KEYVAULT_CONF="$I/keyvault.conf" KEYVAULT_DEST="$I/dest" \
          KEYVAULT_STATE="$I/state" KEYVAULT_MOUNT="$I/mount" KEYVAULT_NO_NOTIFY=1 "$@"; }
 ikv()  { ienv "${NOTTY[@]}" "$SHELL_BIN" "$KV" "$@"; }
 exports() { grep -c . "$I/exports" | tr -d ' '; }
+p12_holds() {   # which test identities the sealed .p12 holds, opened with the recovery key
+    local pw
+    age -d -i "$WORK/recovery.id" "$IFILE" 2>/dev/null | age -d -i "$WORK/recovery.id" 2>/dev/null > "$I/peeled.tgz"
+    pw="$(tar -xzOf "$I/peeled.tgz" vault/manifest.json | jq -r '.items[0].p12_password')"
+    tar -xzOf "$I/peeled.tgz" vault/items/identities-test/identities.p12 > "$I/peeled.p12"
+    { openssl pkcs12 -in "$I/peeled.p12" -nokeys -passin "pass:$pw" -legacy 2>/dev/null \
+        || openssl pkcs12 -in "$I/peeled.p12" -nokeys -passin "pass:$pw" 2>/dev/null; } \
+        | grep -o 'keyvault-test-[a-z]*' | sed 's/.*-//' | sort -u | tr '\n' ' '
+    rm -f "$I/peeled.tgz" "$I/peeled.p12"
+}
 IFILE="$I/dest/keyvault/keychain/identities-test.both.age"
 
 group "Keychain identities: exported only when they changed"
@@ -743,6 +769,7 @@ check "pack never stops for a protected key's password" "$rc" "0"
 grep -q 'locked  is password-protected' <<<"$out" && ok "it warns that the password is not in the vault" || no "it warns that the password is not in the vault" "$out"
 check "the catalog marks it protected" "$(jq -r '.items[] | select(.id=="locked") | .meta.encrypted' "$I/dest/catalog.json")" "true"
 check "the first pack exports" "$(exports)" "1"
+check "only the valid identities, not the expired one" "$(p12_holds)" "one two "
 [[ -f $IFILE ]] && ok "identities are sealed in a file of their own" || no "identities are sealed in a file of their own" "$(ls -R "$I/dest/keyvault")"
 age -d -i "$WORK/recovery.id" "$I/dest/keyvault/both.age" 2>/dev/null | age -d -i "$WORK/recovery.id" 2>/dev/null | tar -tzf - 2>/dev/null | grep -q 'items/identities-test' \
     && no "and not in the level file" || ok "and not in the level file"
@@ -759,10 +786,11 @@ ikv verify >/dev/null 2>&1
 check "verify reads it along with the rest" "$?" "0"
 ikv pack --refresh >/dev/null 2>&1
 check "pack --refresh exports anyway" "$(exports)" "2"
-printf '  3) %s "Apple Development: Test (ABCDE12345)"\n' FEDCBA9876543210FEDCBA9876543210FEDCBA98 >> "$I/identities"
+valid one two three > "$I/identities"
 ikv pack >/dev/null 2>&1
 check "a new identity in the keychain means a new export" "$(exports)" "3"
 check "and the catalog follows" "$(jq -r '.items[] | select(.id=="identities-test") | .certs | length' "$I/dest/catalog.json")" "3"
+check "and the .p12 holds it" "$(p12_holds)" "one three two "
 sed -i '' 's/--desc "signing identities"/--desc "all signing identities"/' "$I/keyvault.conf"
 ikv pack >/dev/null 2>&1
 check "a changed description means a new export" "$(exports)" "4"

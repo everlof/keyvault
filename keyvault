@@ -740,7 +740,7 @@ collect_sparkle() {
 # does not stick for exports. So each `identities` line is sealed on its own, and while the
 # keychain holds exactly the identities that sealed copy was made from, pack keeps it
 # instead of exporting again. `pack --refresh` exports anyway.
-identities_id() { local k; k="$(jq -r '.keychain' <<<"$1")"; printf 'identities-%s\n' "${k%%.*}"; }
+identities_id() { local k; k="$(basename "$(jq -r '.keychain' <<<"$1")")"; printf 'identities-%s\n' "${k%%.*}"; }
 
 identities_unchanged() {   # identities_unchanged <spec> — true when the sealed copy is current
     local keychain id lv desc entry had live m
@@ -759,12 +759,81 @@ identities_unchanged() {   # identities_unchanged <spec> — true when the seale
     ok "$id  unchanged, $(grep -c . <<<"$live") certificates — kept without exporting"
 }
 
+# export_identities <keychain-path> <out.p12> <password> <sha1>… — exactly these identities.
+# `security export` cannot choose: it takes every identity in the keychain, expired and
+# revoked ones too, at one macOS prompt per private key — and one that will not export
+# fails them all. The Security framework can choose; python3's ctypes reaches it.
+export_identities() {
+    python3 - "$@" <<'PY'
+import ctypes as C, hashlib, os, sys
+S = C.cdll.LoadLibrary("/System/Library/Frameworks/Security.framework/Security")
+F = C.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+vp, P = C.c_void_p, C.POINTER
+def fn(lib, name, res, *args):
+    f = getattr(lib, name); f.restype = res; f.argtypes = list(args); return f
+CFStr   = fn(F, "CFStringCreateWithCString", vp, vp, C.c_char_p, C.c_uint32)
+CFArr   = fn(F, "CFArrayCreate", vp, vp, P(vp), C.c_long, vp)
+CFDict  = fn(F, "CFDictionaryCreate", vp, vp, P(vp), P(vp), C.c_long, vp, vp)
+ArrLen  = fn(F, "CFArrayGetCount", C.c_long, vp)
+ArrAt   = fn(F, "CFArrayGetValueAtIndex", vp, vp, C.c_long)
+DataLen = fn(F, "CFDataGetLength", C.c_long, vp)
+DataPtr = fn(F, "CFDataGetBytePtr", vp, vp)
+StrOut  = fn(F, "CFStringGetCString", C.c_bool, vp, C.c_char_p, C.c_long, C.c_uint32)
+KcOpen  = fn(S, "SecKeychainOpen", C.c_int32, C.c_char_p, P(vp))
+Match   = fn(S, "SecItemCopyMatching", C.c_int32, vp, P(vp))
+IdCert  = fn(S, "SecIdentityCopyCertificate", C.c_int32, vp, P(vp))
+CertDER = fn(S, "SecCertificateCopyData", vp, vp)
+Export  = fn(S, "SecItemExport", C.c_int32, vp, C.c_uint32, C.c_uint32, vp, P(vp))
+ErrMsg  = fn(S, "SecCopyErrorMessageString", vp, C.c_int32, vp)
+const = lambda lib, name: vp.in_dll(lib, name).value
+addr  = lambda lib, name: C.addressof(vp.in_dll(lib, name))
+UTF8 = 0x08000100
+def arr(items):
+    a = (vp * len(items))(*items); return CFArr(None, a, len(items), addr(F, "kCFTypeArrayCallBacks"))
+def dct(d):
+    k = (vp * len(d))(*d.keys()); v = (vp * len(d))(*d.values())
+    return CFDict(None, k, v, len(d), addr(F, "kCFTypeDictionaryKeyCallBacks"), addr(F, "kCFTypeDictionaryValueCallBacks"))
+def fail(what, st):
+    buf = C.create_string_buffer(512); m = ErrMsg(st, None)
+    text = buf.value.decode() if m and StrOut(m, buf, 512, UTF8) else ""
+    sys.exit("%s: %s (%d)" % (what, text or "error", st))
+class Params(C.Structure):   # SecItemImportExportKeyParameters
+    _fields_ = [("version", C.c_uint32), ("flags", C.c_uint32), ("passphrase", vp), ("alertTitle", vp),
+                ("alertPrompt", vp), ("accessRef", vp), ("keyUsage", vp), ("keyAttributes", vp)]
+
+if os.environ.get("KEYVAULT_KEYCHAIN_NO_UI") == "1":      # tests: fail instead of asking
+    fn(S, "SecKeychainSetUserInteractionAllowed", C.c_int32, C.c_bool)(False)
+keychain, out, password = sys.argv[1:4]
+want = {s.upper() for s in sys.argv[4:]}
+kc = vp(); st = KcOpen(keychain.encode(), C.byref(kc))
+if st: fail("cannot open " + keychain, st)
+q = dct({const(S, "kSecClass"): const(S, "kSecClassIdentity"),
+         const(S, "kSecMatchLimit"): const(S, "kSecMatchLimitAll"),
+         const(S, "kSecReturnRef"): const(F, "kCFBooleanTrue"),
+         const(S, "kSecMatchSearchList"): arr([kc.value])})
+res = vp(); st = Match(q, C.byref(res))
+if st: fail("cannot list the identities in " + keychain, st)
+pick, seen = [], set()
+for i in range(ArrLen(res)):
+    ident = ArrAt(res, i); cert = vp()
+    if IdCert(ident, C.byref(cert)): continue
+    der = CertDER(cert); sha = hashlib.sha1(C.string_at(DataPtr(der), DataLen(der))).hexdigest().upper()
+    if sha in want and sha not in seen: pick.append(ident); seen.add(sha)
+if want - seen: sys.exit("not in %s: %s" % (keychain, " ".join(sorted(want - seen))))
+params = Params(0, 0, CFStr(None, password.encode(), UTF8), None, None, None, None, None)
+data = vp(); st = Export(arr(pick), 12, 0, C.byref(params), C.byref(data))   # 12: kSecFormatPKCS12
+if st: fail("export", st)
+fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, C.string_at(DataPtr(data), DataLen(data))); os.close(fd)
+PY
+}
+
 collect_identities() {
     local spec="$1"
     local keychain desc id dir out pw
     keychain="$(jq -r '.keychain' <<<"$spec")"
     desc="$(jq -r '.desc' <<<"$spec")"
-    id="identities-${keychain%%.*}"
+    id="$(identities_id "$spec")"
 
     local listing
     listing="$(security find-identity -v "$keychain" 2>/dev/null)"
@@ -795,9 +864,18 @@ collect_identities() {
     rm -f "$out"
     pw="$(random_password)"
 
-    info "    macOS will ask permission for each private key — click Allow (or Always Allow)."
-    if ! security export -k "$keychain" -t identities -f pkcs12 -P "$pw" -o "$out" 2>/dev/null || [[ ! -s $out ]]; then
-        bad "$id  'security export' failed or was denied"
+    local kcpath err rc
+    [[ $keychain == /* ]] && kcpath="$keychain" || kcpath="$HOME/Library/Keychains/$keychain"
+    if have python3 && python3 -c 'import ctypes' 2>/dev/null; then
+        info "    macOS asks once for each of these $(jq -r 'length' <<<"$certs_json") private keys (the dialog names Python) — click Allow."
+        # shellcheck disable=SC2046
+        err="$(export_identities "$kcpath" "$out" "$pw" $(jq -r '.[].sha1' <<<"$certs_json") 2>&1 >/dev/null)"; rc=$?
+    else
+        info "    macOS asks once for every private key in $keychain, expired ones too — click Allow."
+        err="$(security export -k "$keychain" -t identities -f pkcs12 -P "$pw" -o "$out" 2>&1 >/dev/null)"; rc=$?
+    fi
+    if (( rc )) || [[ ! -s $out ]]; then
+        bad "$id  export failed or was denied${err:+: $err}"
         return 1
     fi
     chmod 600 "$out"
@@ -1400,7 +1478,7 @@ cmd_validate() {
             [[ -n $spec ]] || continue
             case "$(jq -r '.type' <<<"$spec")" in
                 sparkle) want="sparkle-$(jq -r '.account' <<<"$spec")" ;;
-                identities) want="identities-$(jq -r '.keychain' <<<"$spec" | cut -d. -f1)" ;;
+                identities) want="$(identities_id "$spec")" ;;
                 file|glob)
                     # Files are matched by where they live, not by id: a new key dropped into
                     # a globbed folder has no id until the next pack gives it one.
@@ -1488,7 +1566,8 @@ cmd_restore() {
             identities)
                 local pw keychain
                 pw="$(jq -r '.p12_password' <<<"$it")"
-                keychain="$HOME/Library/Keychains/$(jq -r '.keychain' <<<"$it")"
+                keychain="$(jq -r '.keychain' <<<"$it")"
+                [[ $keychain == /* ]] || keychain="$HOME/Library/Keychains/$keychain"
                 say "$(act)import $(jq -r '.certs | length' <<<"$it") identities into $(tildify "$keychain")"
                 if (( apply )); then
                     local out

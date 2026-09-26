@@ -28,8 +28,9 @@
 #       proves the backed-up key still signs updates installed copies will accept.
 #
 #   identities <keychain> [--desc TEXT] [--level L]
-#       Every code-signing identity (certificate + private key) in a keychain, exported
-#       as one .p12. macOS asks once per key — click Allow. Later packs export again only
+#       Every valid identity (certificate + private key) in a keychain, exported as one
+#       .p12; expired and revoked ones are left out. macOS asks once per key (the dialog
+#       names Python) — click Allow. Later packs export again only
 #       when the keychain's identities change (or with `pack --refresh`).
 #
 #   file <path> [--id NAME] [--desc TEXT] [--level L]

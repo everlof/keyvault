@@ -160,7 +160,9 @@ copies the vault to `archive/`, which keeps the last ten.
 Exporting signing identities costs one macOS prompt per private key, every time; "Always
 Allow" does not stick for exports. So each `identities` line is sealed in a file of its own
 (`keychain/`), and `pack` exports again only when the keychain's identities differ from the
-ones in the vault. `pack --refresh` exports anyway.
+ones in the vault. `pack --refresh` exports anyway. Only valid identities are exported:
+expired, revoked and untrusted ones stay behind, and cost no prompt. (That takes python3;
+without it, `security export` takes every identity in the keychain.)
 
 ## Agents: knowing what exists, borrowing what they need
 
