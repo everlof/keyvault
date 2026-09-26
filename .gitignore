@@ -12,6 +12,9 @@
 *.mobileprovision
 private-key*
 *secret*
+# …except the tool itself and its tests, which this pattern would silently swallow.
+!/secret
+!/tests/test_secret.sh
 vaults/
 out/
 .DS_Store
