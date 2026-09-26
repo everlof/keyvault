@@ -167,7 +167,10 @@ without it, `security export` takes every identity in the keychain.)
 ## Agents: knowing what exists, borrowing what they need
 
 **What is in there?** Every pack, add and remove updates `catalog.json` next to the vault. It
-lists every item's id, level, kind and public facts, and no secrets. The facts are derived
+lists every item's id, level, kind and public facts, and no secrets. `catalog`, `find` and
+`describe` also list your tokens (name, description, whether it asks, whether it is backed
+up), so an agent has one place to look for anything auth-related. Tokens are listed from keychain
+attributes, which never decrypts anything and never raises a dialog. The facts are derived
 from the keys themselves:
 
 - an App Store Connect key's id
@@ -250,6 +253,22 @@ a prompt. That keeps tokens out of the places they leak from by accident, but it
 stop someone reading on purpose. An `--ask` item trusts no application, so every read is a
 macOS dialog you answer. **Allow** is one-time; **Always Allow** would undo the point.
 
+**Backed up by keyvault.** `keyvault secret` is `secret` with a backup built in:
+
+```bash
+keyvault secret set LOOPIA_API_PASSWORD --ask   # stored in the keychain, and a copy sealed in the vault
+keyvault secret rm LOOPIA_API_PASSWORD          # both gone (the vault's archive keeps a copy)
+keyvault secret run LOOPIA_API_PASSWORD -- …    # list, run, get: exactly as `secret`
+keyvault secret backup                          # once, for tokens stored with plain `secret`
+```
+
+`set` reads the value once and hands it to both, so the backup never reads it back from the
+keychain and never raises a dialog, not even for an `--ask` token. The copy sits in
+`added/secret-<NAME>.both.age`. `validate` reports a token with no copy, or one changed
+behind keyvault's back (every `secret set` renews the item's modification time, which
+listing sees without decrypting). `keyvault restore` puts tokens back with `secret set`,
+`--ask` and all; one already in the keychain is left alone unless you pass `--force`.
+
 Values reach `security` hex-encoded on stdin, never in argv, so they never show up in `ps`.
 `security -i` exits 0 even when its command fails, so every write is verified afterwards. A
 replacement parks the new value before it removes the old one, so a failure never loses
@@ -284,6 +303,7 @@ sandbox holds against that. Rules still stop the accidental read, which is the c
 ```
 keyvault init | setup | edit | doctor | status | card | recovery-check
 keyvault pack [--refresh] | list | verify | validate
+keyvault secret set NAME [--ask] | rm NAME | backup | run NAME -- <cmd…> | list
 keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
 keyvault remove <id> | show <id> --out PATH
 keyvault restore [--only ID] [--force] [--apply]

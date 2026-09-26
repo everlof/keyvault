@@ -80,6 +80,9 @@
 # Recovery codes and one-off secrets go in with `keyvault add`, not here:
 #   keyvault add github-recovery-codes --file ~/Downloads/github-recovery-codes.txt --level both
 
+# Everyday tokens (API keys, deploy tokens) are not declared here: `keyvault secret set NAME`
+# stores one and backs it up in the same step.
+
 # ---------------------------------------------------------------- for agents
 #
 # Issuer ids: appstoreconnect.apple.com → Users and Access → Integrations.

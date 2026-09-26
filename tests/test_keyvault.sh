@@ -32,7 +32,7 @@ check_true() { if "$@"; then ok "$1"; else no "$1"; fi; } # unused guard, kept e
 # ---------------------------------------------------------------------------- fixture
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/keyvault-test.XXXXXX")"
-trap '[[ -n ${IKC:-} ]] && security delete-keychain "$IKC" 2>/dev/null; rm -rf "$WORK"; [[ -n ${MOUNT:-} ]] && rm -rf "$MOUNT" 2>/dev/null; true' EXIT
+trap 'for k in ${IKC:-} ${TKC:-} ${TKC2:-}; do security delete-keychain "$k" 2>/dev/null; done; rm -rf "$WORK"; [[ -n ${MOUNT:-} ]] && rm -rf "$MOUNT" 2>/dev/null; true' EXIT
 
 mkdir -p "$WORK/src" "$WORK/globdir" "$WORK/dest" "$WORK/state"
 
@@ -76,6 +76,10 @@ export KEYVAULT_RECOVERY_IDENTITY="$WORK/recovery.id"   # only used with --recov
 export KEYVAULT_MOUNT="$WORK/mount"
 export KEYVAULT_NO_RAMDISK=1     # the fallback workspace; the ramdisk path is checked separately
 export NO_COLOR=1
+# The catalog lists the tokens `secret` keeps. Every group sees none — never the developer's
+# own — unless it brings a throwaway keychain of its own.
+printf '#!/bin/bash\n[[ $1 == list ]] && echo "[]"\n' > "$WORK/no-secret"; chmod +x "$WORK/no-secret"
+export KEYVAULT_SECRET_BIN="$WORK/no-secret"
 
 # Detached from any controlling terminal, the way an agent's shell is. Without this the
 # suite would behave differently in a developer's terminal than in CI: age would find
@@ -810,6 +814,92 @@ ikv pack >/dev/null 2>&1
 [[ -e $IFILE ]] && no "dropping the line drops its file" || ok "dropping the line drops its file"
 jq -e 'any(.items[]; .id == "identities-test")' "$I/dest/catalog.json" >/dev/null \
     && no "and its catalog entry" || ok "and its catalog entry"
+
+# ---------------------------------------------------------------------------- secret tokens
+#
+# `keyvault secret` on a throwaway keychain and a throwaway vault. The real `secret` does the
+# storing; a stand-in in front of it logs every read and refuses GUARDED, an --ask token:
+# reading that would raise a dialog, so nothing here may.
+
+T="$WORK/tok"
+mkdir -p "$T/dest" "$T/state" "$T/sstate"
+TKC="$T/secret.keychain-db"; TKC2="$T/restored.keychain-db"
+for k in "$TKC" "$TKC2"; do
+    security create-keychain -p test "$k" && security unlock-keychain -p test "$k" && security set-keychain-settings "$k"
+done
+cat > "$T/secret" <<EOF
+#!/bin/bash
+if [[ \$1 == get ]]; then
+    echo "\$2" >> "$T/reads"
+    [[ \$2 == GUARDED ]] && { echo "test: reading GUARDED would raise a dialog" >&2; exit 1; }
+fi
+exec "$ROOT/secret" "\$@"
+EOF
+chmod +x "$T/secret"; : > "$T/reads"
+printf 'file "%s" --id beta\n' "$WORK/src/beta.key" > "$T/keyvault.conf"
+tenv() { env SECRET_KEYCHAIN="${TK:-$TKC}" SECRET_STATE="$T/sstate" KEYVAULT_SECRET_BIN="$T/secret" KEYVAULT_CONF="$T/keyvault.conf" \
+         KEYVAULT_DEST="$T/dest" KEYVAULT_STATE="$T/state" KEYVAULT_MOUNT="$T/mount" KEYVAULT_NO_NOTIFY=1 "$@"; }
+tkv()  { tenv "${NOTTY[@]}" "$SHELL_BIN" "$KV" "$@"; }
+tsec() { tenv "$SHELL_BIN" "$ROOT/secret" "$@"; }        # plain `secret`, no backup
+reads() { tr '\n' ' ' < "$T/reads"; }
+copy_of() { printf '%s/dest/keyvault/added/secret-%s.both.age' "$T" "$1"; }
+tkv pack >/dev/null 2>&1
+
+group "keyvault secret: stored once, backed up at once"
+out="$(printf 'loopia-pw' | tkv secret set LOOPIA_API_PASSWORD --stdin --desc "Loopia API password" 2>&1)"; rc=$?
+check "set exits 0" "$rc" "0"
+grep -q 'backed up in keyvault' <<<"$out" && ok "and says it is backed up" || no "and says it is backed up" "$out"
+check "the token is in the keychain" "$(tsec get LOOPIA_API_PASSWORD 2>/dev/null)" "loopia-pw"
+[[ -f $(copy_of LOOPIA_API_PASSWORD) ]] && ok "and a copy is sealed in the vault" || no "and a copy is sealed in the vault" "$(ls "$T/dest/keyvault/added" 2>&1)"
+printf 'guarded-value' | tkv secret set GUARDED --stdin --ask --desc "an ask token" >/dev/null 2>&1
+[[ -f $(copy_of GUARDED) ]] && ok "an --ask token is backed up too" || no "an --ask token is backed up too"
+check "storing never reads a token back: no dialog, even for --ask" "$(reads)" ""
+grep -rqE 'loopia-pw|guarded-value' "$T/dest" && no "no value reaches the vault folder in the clear" || ok "no value reaches the vault folder in the clear"
+check "run passes through to secret" "$(tkv secret run LOOPIA_API_PASSWORD -- sh -c 'printf %s "$LOOPIA_API_PASSWORD"' 2>/dev/null)" "loopia-pw"
+grep -q GUARDED <<<"$(tkv secret list 2>&1)" && ok "and so does list" || no "and so does list"
+
+group "keyvault catalog: one place to look"
+out="$(tkv catalog 2>&1)"
+grep -qE '^LOOPIA_API_PASSWORD +run +token' <<<"$out" && ok "tokens are in the catalog" || no "tokens are in the catalog" "$out"
+grep -qE '^GUARDED +ask ' <<<"$out" && ok "an --ask token shows as ask" || no "an --ask token shows as ask" "$out"
+grep -qE 'no backup|out of date' <<<"$out" && no "both show as backed up" "$out" || ok "both show as backed up"
+grep -q '^secret-' <<<"$out" && no "a token's copy is not listed twice" "$out" || ok "a token's copy is not listed twice"
+out="$(tkv describe LOOPIA_API_PASSWORD 2>&1)"
+grep -q 'keyvault secret run LOOPIA_API_PASSWORD -- ' <<<"$out" && ok "describe says how to use a token" || no "describe says how to use a token" "$out"
+grep -q 'keychain dialog' <<<"$(tkv describe GUARDED 2>&1)" && ok "and warns when every use asks the user" || no "and warns when every use asks the user"
+grep -q LOOPIA_API_PASSWORD <<<"$(tkv find loopia 2>&1)" && ok "find searches tokens" || no "find searches tokens"
+grep -q "is a token" <<<"$(tkv request LOOPIA_API_PASSWORD --reason test 2>&1)" \
+    && ok "requesting a token points to keyvault secret run" || no "requesting a token points to keyvault secret run"
+check "browsing reads no token" "$(reads)" ""
+
+group "keyvault secret: catching up, keeping up"
+printf 'plain-value' | tsec set PLAIN_TOKEN --stdin --desc "stored with plain secret" 2>/dev/null
+grep -qE '^PLAIN_TOKEN .*no backup' <<<"$(tkv catalog 2>&1)" && ok "a token stored with plain secret shows no backup" || no "a token stored with plain secret shows no backup"
+out="$(tkv validate 2>&1)"; rc=$?
+check "and validate reports the vault out of date" "$rc" "2"
+grep -q 'keyvault secret backup' <<<"$out" && ok "and says what to run" || no "and says what to run" "$out"
+out="$(tkv secret backup 2>&1)"; rc=$?
+check "secret backup exits 0" "$rc" "0"
+check "and reads only the token without a copy" "$(reads)" "PLAIN_TOKEN "
+[[ -f $(copy_of PLAIN_TOKEN) ]] && ok "which is now backed up" || no "which is now backed up" "$out"
+sleep 1; printf 'loopia-pw2' | tsec set LOOPIA_API_PASSWORD --stdin --desc "Loopia API password" 2>/dev/null
+grep -qE '^LOOPIA_API_PASSWORD .*out of date' <<<"$(tkv catalog 2>&1)" && ok "a token changed behind its back shows its copy out of date" || no "a token changed behind its back shows its copy out of date"
+grep -q 'changed since it was backed up' <<<"$(tkv validate 2>&1)" && ok "validate says so too" || no "validate says so too"
+: > "$T/reads"; tkv secret backup >/dev/null 2>&1
+check "secret backup renews just that one" "$(reads)" "LOOPIA_API_PASSWORD "
+tkv validate >/dev/null 2>&1
+check "then the vault matches again" "$?" "0"
+tkv secret rm PLAIN_TOKEN >/dev/null 2>&1
+[[ -e $(copy_of PLAIN_TOKEN) ]] && no "rm removes the copy too" || ok "rm removes the copy too"
+
+group "keyvault restore: tokens go back into secret"
+grep -q "already in 'secret'" <<<"$(tkv restore 2>&1)" && ok "tokens already there are left alone" || no "tokens already there are left alone"
+out="$(TK="$TKC2" tkv restore 2>&1)"
+grep -q "would store GUARDED with 'secret' (--ask)" <<<"$out" && ok "a dry run lists them, --ask kept" || no "a dry run lists them, --ask kept" "$out"
+TK="$TKC2" tkv restore --apply >/dev/null 2>&1
+check "restore --apply stores the latest value" "$(TK="$TKC2" tsec get LOOPIA_API_PASSWORD 2>/dev/null)" "loopia-pw2"
+check "keeps --ask" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="GUARDED") | .ask')" "true"
+check "and the description" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="LOOPIA_API_PASSWORD") | .desc')" "Loopia API password"
 
 # ---------------------------------------------------------------------------- ramdisk
 

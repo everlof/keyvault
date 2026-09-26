@@ -34,6 +34,12 @@ grep -q 'API_TOKEN' <<<"$out" && ok "list shows names" || no "list shows names" 
 grep -q 'rotated' <<<"$out" && ok "list shows descriptions" || no "list shows descriptions" "$out"
 grep -q 'v2' <<<"$out" && no "list never shows values" || ok "list never shows values"
 check "list --json" "$(sec list --json | jq -r '.[] | select(.name=="API_TOKEN") | .desc')" "rotated"
+changed="$(sec list --json | jq -r '.[] | select(.name=="API_TOKEN") | .changed')"
+[[ $changed =~ ^[0-9]{14}Z$ ]] && ok "list --json says when each changed" || no "list --json says when each changed" "$changed"
+sleep 1; printf 'v3' | sec set API_TOKEN --stdin --desc "rotated" 2>/dev/null
+[[ "$(sec list --json | jq -r '.[] | select(.name=="API_TOKEN") | .changed')" != "$changed" ]] \
+    && ok "and a new value moves it" || no "and a new value moves it"
+printf 'v2' | sec set API_TOKEN --stdin --desc "rotated" 2>/dev/null
 
 check "run puts the secret in the command's environment" \
     "$(sec run API_TOKEN -- sh -c 'printf %s "$API_TOKEN"')" "v2"

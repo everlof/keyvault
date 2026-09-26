@@ -1,5 +1,9 @@
 # Using keyvault as an agent
 
+`keyvault catalog` is the one place to look for anything auth- or key-related on this
+machine: the vault's keys and the everyday tokens `secret` keeps. It shows what exists,
+what it is for and how to use it. It never shows a value, and looking costs nothing.
+
 This machine keeps its irreplaceable keys in keyvault: Sparkle update keys, code-signing
 identities, App Store Connect `.p8` keys, GitHub App keys, the SOPS master key, recovery
 codes. You cannot open it, and you should not try. Every item has a level (`biometric`,
@@ -12,11 +16,19 @@ the one way to trick them, so don't.
 
 ## Find what you need (no permission required)
 
-    keyvault catalog            # every item: id, level, kind, key ids, public keys, expiry
-    keyvault find <text>        # e.g. an ASC key id, an app name, a team id
-    keyvault describe <id>      # details, the $KV_ variable a grant sets, a usage example
+    keyvault catalog            # every key and token: id, level, kind, key ids, public keys, expiry
+    keyvault find <text>        # e.g. an ASC key id, an app name, a team id, "loopia"
+    keyvault describe <id>      # details, and exactly how to use it
 
 Add `--json` to `catalog`/`find` for machine-readable output.
+
+The LEVEL column says how an item is used:
+
+| Level | What it is | How you use it |
+|---|---|---|
+| `biometric`, `passphrase`, `both` | a key in the vault | borrow it: `keyvault request` (below) |
+| `run` | a token | `keyvault secret run NAME -- <command>` |
+| `ask` | a token that asks the user every time | the same, after telling the user |
 
 ## First: does it need the vault at all?
 
@@ -33,12 +45,14 @@ the output with `keyvault result <grant>`. Write `$KV_<ID>` in single quotes so 
 leaves it alone; keyvault fills in the path. No shell runs the command, so wrap pipelines
 in `sh -c '…'`.
 
-## Everyday tokens: `secret`
+## Everyday tokens: `keyvault secret`
 
 API keys and deploy tokens live in the keychain, not in env files or shell profiles:
 
-    secret list                                  # names and descriptions, never values
-    secret run SENTRY_AUTH_TOKEN -- sentry-cli …  # in that command's environment only
+    keyvault secret run SENTRY_AUTH_TOKEN -- sentry-cli …  # in that command's environment only
+    keyvault secret run TOKEN=SENTRY_AUTH_TOKEN -- …       # under the name the tool expects
+
+(`secret run` is the same thing.) Never `set` or `rm` a token unless the user asked you to.
 
 Items marked `ask` raise a macOS dialog the user must click. If one appears, tell them what
 you are running and why. Never use `secret get` in scripts, or print a value.

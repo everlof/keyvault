@@ -2,6 +2,7 @@
 # borrow specific items for a bounded time, with a human approving each loan.
 #
 #   anyone, no passphrase:   catalog · find · describe · request · grants · revoke
+#                            (catalog, find and describe cover the `keyvault secret` tokens too)
 #   human at a terminal:     approve · grant             (Touch ID and/or passphrase, per level)
 #   holder of a live grant:  exec · env
 #   after a one-shot run:    result
@@ -63,6 +64,29 @@ audit() {
 catalog_require() {
     [[ -f $KV_CATALOG ]] && return 0
     die "no catalog at $(tildify "$KV_CATALOG") — the vault has not been packed (ask the user to run 'keyvault pack')"
+}
+
+# One place to look: the vault's items and the tokens `secret` keeps. Tokens are listed
+# live and never read; `backup` says whether the vault holds a current copy (current),
+# an older one (stale) or none. A token's copy is shown as the token, not twice.
+tokens_items() {
+    local copies
+    copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // "")}]' "$KV_CATALOG" 2>/dev/null)"
+    [[ -n $copies ]] || copies='[]'
+    tokens_list | jq -c --argjson b "$copies" 'map(. as $k | {id: .name, type: "token", kind: "token",
+        level: (if .ask then "ask" else "run" end), desc,
+        backup: (if any($b[]; .t == $k.name and .c == ($k.changed // "")) then "current"
+                 elif any($b[]; .t == $k.name) then "stale" else "none" end)})'
+}
+all_items() {   # every item an agent may know about, vault first
+    local vault='[]'
+    [[ -f $KV_CATALOG ]] && vault="$(jq -c '[.items // [] | .[] | select(.meta.token | not)]' "$KV_CATALOG")"
+    jq -nc --argjson v "$vault" --argjson t "$(tokens_items)" '$v + $t'
+}
+something_require() {
+    [[ -f $KV_CATALOG ]] && return 0
+    [[ $(tokens_items) != "[]" ]] && return 0
+    catalog_require
 }
 
 grant_file()  { printf '%s/%s.json\n' "$KV_GRANTS" "$1"; }
@@ -150,6 +174,7 @@ item_line() {   # one catalog item -> one line of the table
             if .kind == "asc-api-key" then "key \(.meta.asc_key_id)" + (if .meta.issuer_id then "  issuer \(.meta.issuer_id)" else "" end)
             elif .type == "sparkle" then "ed25519 \(.public_key)"
             elif .type == "identities" then "\(.certs | length) certs: " + ([.certs[].team_id // empty] | unique | join(","))
+            elif .type == "token" then (.desc // "") + ({current: "", stale: "  (backup out of date)", none: "  (no backup)"}[.backup] // "")
             elif .meta.subject then .meta.subject
             elif .meta.age_recipient then .meta.age_recipient
             elif .path then .path
@@ -161,22 +186,30 @@ item_line() {   # one catalog item -> one line of the table
 # ---------------------------------------------------------------------------- read-only
 
 cmd_catalog() {
-    catalog_require
-    if [[ ${1:-} == --json ]]; then cat "$KV_CATALOG"; return 0; fi
-    say "$(dim "$(tildify "$KV_CATALOG") — packed $(jq -r '.packed_at // "?"' "$KV_CATALOG"), no secrets in here")"
+    something_require
+    if [[ ${1:-} == --json ]]; then
+        if [[ -f $KV_CATALOG ]]; then jq --argjson t "$(tokens_items)" '. + {tokens: $t}' "$KV_CATALOG"
+        else jq -n --argjson t "$(tokens_items)" '{items: [], tokens: $t}'; fi
+        return 0
+    fi
+    if [[ -f $KV_CATALOG ]]; then
+        say "$(dim "$(tildify "$KV_CATALOG") — packed $(jq -r '.packed_at // "?"' "$KV_CATALOG"), no secrets in here")"
+    fi
     printf '%-38s %-11s %-20s %s\n' ID LEVEL KIND FACTS
     local it
-    while IFS= read -r it; do item_line "$it"; done < <(jq -c '.items[]' "$KV_CATALOG")
+    while IFS= read -r it; do item_line "$it"; done < <(all_items | jq -c '.[]')
     say ""
+    say "$(dim "LEVEL: biometric/passphrase/both — a vault item, borrowed with 'keyvault request'.")"
+    say "$(dim "       run/ask — a token, used with 'keyvault secret run'; ask: every use asks the user.")"
     say "$(dim "keyvault describe <id> for everything known about one item; keyvault find <text> to search.")"
 }
 
 cmd_find() {
     (($#)) || die "usage: keyvault find <text> [--json]"
-    catalog_require
+    something_require
     local q="$1" json=0; [[ ${2:-} == --json ]] && json=1
     local hits
-    hits="$(jq -c --arg q "$q" '.items[] | select(tostring | ascii_downcase | contains($q | ascii_downcase))' "$KV_CATALOG")"
+    hits="$(all_items | jq -c --arg q "$q" '.[] | select(tostring | ascii_downcase | contains($q | ascii_downcase))')"
     [[ -n $hits ]] || { info "nothing in the catalog matches '$q'"; return 1; }
     if (( json )); then jq -s . <<<"$hits"; return 0; fi
     local it; while IFS= read -r it; do item_line "$it"; done <<<"$hits"
@@ -184,10 +217,19 @@ cmd_find() {
 
 cmd_describe() {
     (($#)) || die "usage: keyvault describe <id>"
-    catalog_require
-    local it; it="$(jq -c --arg id "$1" '.items[] | select(.id == $id)' "$KV_CATALOG")"
+    something_require
+    local it; it="$(all_items | jq -c --arg id "$1" 'first(.[] | select(.id == $id)) // empty')"
     [[ -n $it ]] || die "no item '$1' in the catalog (keyvault find <text>)"
     jq . <<<"$it"
+    if [[ $(jq -r '.type' <<<"$it") == token ]]; then
+        say ""
+        say "A token. Use it for one command, never print or copy it:"
+        say "  keyvault secret run $1 -- <command…>     (\$$1 is set for that command only)"
+        say "  keyvault secret run OTHER_NAME=$1 -- …   (under the name the tool expects)"
+        [[ $(jq -r '.level' <<<"$it") == ask ]] \
+            && say "Every use raises a keychain dialog the user must click: tell them before you run it."
+        return 0
+    fi
     local var; var="$(env_name "$1")"
     say ""
     say "Once granted, \$$var is the path to it inside 'keyvault exec'."
@@ -206,8 +248,13 @@ grant_new_id() { printf 'kv-%s\n' "$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 
 grant_record() {   # grant_record <reason> <ttl-seconds> <id>…  -> prints gid
     local reason="$1" ttl="$2"; shift 2
+    local id toks; toks="$(tokens_items)"
+    for id in "$@"; do
+        jq -e --arg id "$id" 'any(.items[]; .id == $id)' "$KV_CATALOG" >/dev/null 2>&1 && continue
+        jq -e --arg id "$id" 'any(.[]; .id == $id)' <<<"$toks" >/dev/null \
+            && die "'$id' is a token, not a vault item: use it with 'keyvault secret run $id -- <command…>'"
+    done
     catalog_require
-    local id
     for id in "$@"; do
         jq -e --arg id "$id" 'any(.items[]; .id == $id)' "$KV_CATALOG" >/dev/null \
             || die "no item '$id' in the catalog (keyvault find <text>)"

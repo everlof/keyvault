@@ -161,6 +161,34 @@ kv_sparkle_bin() {
     printf '%s\n' "$d"
 }
 
+# The `secret` tool beside this script, else on PATH. keyvault talks to it only through its
+# commands (list --json, get, set), never to its keychain items directly.
+secret_bin() {
+    if [[ -n ${KEYVAULT_SECRET_BIN:-} ]]; then printf '%s\n' "$KEYVAULT_SECRET_BIN"; return 0; fi
+    [[ -x $KV_ROOT/secret ]] && { printf '%s\n' "$KV_ROOT/secret"; return 0; }
+    command -v secret 2>/dev/null
+}
+
+# Its tokens as [{name, ask, desc, changed}] — attributes only: listing never decrypts, so
+# it never raises a dialog. [] when there is no `secret` or nothing in it.
+tokens_list() {
+    local sb out
+    sb="$(secret_bin)" || { echo '[]'; return 0; }
+    out="$("$sb" list --json 2>/dev/null)" && [[ -n $out ]] || out='[]'
+    printf '%s\n' "$out"
+}
+
+# A token's copy in the vault: an added item, secret-<NAME>, sealed at `both`. Its meta
+# says which token it is, whether it asks, and when the keychain item last changed, so a
+# copy gone stale shows without decrypting anything.
+token_id()      { printf 'secret-%s\n' "$1"; }
+token_changed() { tokens_list | jq -r --arg n "$1" '.[] | select(.name == $n) | .changed // ""'; }
+token_seal() {   # token_seal <name> <ask 0|1> <desc> — the value on stdin
+    local changed; changed="$(token_changed "$1" </dev/null)"
+    "${BASH:-bash}" "$KV_ROOT/keyvault" add "$(token_id "$1")" --stdin --level both --desc "$3" \
+        --meta "token=$1" --meta "ask=$( (( $2 )) && echo true || echo false)" --meta "changed=$changed"
+}
+
 # ------------------------------------------------------------- ed25519, without a keychain
 #
 # Sparkle exports the private key as base64 of either the 32-byte seed or the 64-byte
@@ -1247,6 +1275,90 @@ cmd_remove() {
     ok "$id  removed (a copy stays in $(tildify "$KV_ARCHIVE") for $KV_ARCHIVE_KEEP more changes)"
 }
 
+# ---------------------------------------------------------------------------- secret
+#
+# `keyvault secret …` is the `secret` tool with a backup built in. `set` stores the token and
+# seals a copy into the vault from the value it already holds: encrypting needs no unlock,
+# so the backup costs no prompt, not even for an --ask token. `rm` removes both. `backup`
+# catches up on tokens stored with plain `secret`. Everything else passes straight through.
+
+cmd_secret() {
+    local sb; sb="$(secret_bin)" || die "the 'secret' tool was not found next to keyvault or on PATH"
+    local sub="${1:-help}"; shift || true
+    case "$sub" in
+        set)       secret_set "$sb" "$@" ;;
+        rm|remove) secret_rm "$sb" "$@" ;;
+        backup)    secret_backup "$sb" ;;
+        *)         exec "$sb" "$sub" "$@" ;;
+    esac
+}
+
+secret_set() {
+    local sb="$1"; shift
+    (($#)) || die "usage: keyvault secret set NAME [--desc TEXT] [--ask] [--stdin]"
+    local name="$1"; shift
+    local desc="" ask=0 stdin=0 v v2 err
+    while (($#)); do
+        case "$1" in
+            --desc)  desc="$2"; shift 2 ;;
+            --ask)   ask=1; shift ;;
+            --stdin) stdin=1; shift ;;
+            *) die "secret set: unknown option '$1'" ;;
+        esac
+    done
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "'$name' is not a valid name (letters, digits, _)"
+    # Read once, here: the value goes to both places and is never read back from the keychain.
+    if (( stdin )); then
+        v="$(cat)"
+    else
+        { exec 4</dev/tty; } 2>/dev/null || die "no terminal to type into — use --stdin"
+        printf 'Value for %s (not echoed): ' "$name" >/dev/tty; IFS= read -rs v <&4; printf '\n' >/dev/tty
+        printf 'Again: ' >/dev/tty;                          IFS= read -rs v2 <&4; printf '\n' >/dev/tty
+        exec 4<&-
+        [[ $v == "$v2" ]] || die "the two entries differ"
+    fi
+    [[ -n $v ]] || die "empty value"
+    # shellcheck disable=SC2046
+    printf '%s' "$v" | "$sb" set "$name" --stdin --desc "$desc" $( ((ask)) && echo --ask) || exit 1
+    if err="$(printf '%s' "$v" | token_seal "$name" "$ask" "$desc" 2>&1 >/dev/null)"; then
+        v=""; ok "$name  backed up in keyvault"
+    else
+        v=""; warn "$name  is stored, but NOT backed up in keyvault: ${err#keyvault: }"
+        note "fix that, then run: keyvault secret backup"
+        return 1
+    fi
+}
+
+secret_rm() {
+    local sb="$1"; shift
+    (($#)) || die "usage: keyvault secret rm NAME"
+    "$sb" rm "$1" || exit 1
+    added_file "$(token_id "$1")" >/dev/null || return 0
+    "${BASH:-bash}" "$KV_ROOT/keyvault" remove "$(token_id "$1")" >/dev/null 2>&1 \
+        && ok "$1  removed from keyvault too (the archive keeps it for $KV_ARCHIVE_KEEP more changes)" \
+        || { warn "$1  its copy stays in keyvault: keyvault remove $(token_id "$1")"; return 1; }
+}
+
+secret_backup() {   # copy every token whose copy is missing or older than the token
+    local sb="$1" copies t name ask err n=0 rc=0
+    copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // "")}]' "$KV_CATALOG" 2>/dev/null)"
+    [[ -n $copies ]] || copies='[]'
+    while IFS= read -r t; do
+        name="$(jq -r '.name' <<<"$t")"; ask="$(jq -r '.ask' <<<"$t")"
+        jq -e --arg n "$name" --arg c "$(jq -r '.changed // ""' <<<"$t")" 'any(.[]; .t == $n and .c == $c)' \
+            <<<"$copies" >/dev/null && continue
+        [[ $ask == true ]] && info "  reading $name raises the keychain dialog — click Allow"
+        if err="$("$sb" get "$name" 2>/dev/null \
+                  | token_seal "$name" "$([[ $ask == true ]] && echo 1 || echo 0)" "$(jq -r '.desc // ""' <<<"$t")" 2>&1 >/dev/null)"; then
+            ok "$name  backed up"; n=$((n + 1))
+        else
+            bad "$name  ${err#keyvault: }"; rc=1
+        fi
+    done < <(tokens_list | jq -c '.[]')
+    (( n || rc )) || ok "every token already has a current copy in keyvault"
+    return $rc
+}
+
 # ---------------------------------------------------------------------------- show
 
 cmd_show() {
@@ -1375,7 +1487,7 @@ cmd_validate() {
     vault_load
     step "Validating against this machine"
 
-    local rc=0 stale=0 it
+    local rc=0 stale=0 it toks; toks="$(tokens_list)"
     while IFS= read -r it; do
         local id type; id="$(jq -r '.id' <<<"$it")"; type="$(jq -r '.type' <<<"$it")"
         local full; full="$(session_dir)/$(jq -r '.file' <<<"$it")"
@@ -1466,10 +1578,26 @@ cmd_validate() {
                 ;;
 
             secret)
-                ok "$id  present ($(jq -r '.desc // "no description"' <<<"$it"))"
+                local token; token="$(jq -r '.meta.token // ""' <<<"$it")"
+                if [[ -z $token ]]; then
+                    ok "$id  present ($(jq -r '.desc // "no description"' <<<"$it"))"
+                elif ! jq -e --arg n "$token" 'any(.[]; .name == $n)' <<<"$toks" >/dev/null; then
+                    warn "$id  $token is no longer in 'secret' — the vault still has it (restorable)"
+                elif [[ $(jq -r --arg n "$token" '.[] | select(.name == $n) | .changed // ""' <<<"$toks") \
+                        != "$(jq -r '.meta.changed // ""' <<<"$it")" ]]; then
+                    warn "$id  $token changed since it was backed up — run 'keyvault secret backup'"; stale=1
+                else
+                    ok "$id  matches $token in 'secret'"
+                fi
                 ;;
         esac
     done < <(jq -c '.items[]' "$(session_manifest)")
+
+    local tn
+    while IFS= read -r tn; do
+        [[ -n $tn ]] || continue
+        mf_has "$(token_id "$tn")" || { warn "$tn  a 'secret' token with no copy in the vault — run 'keyvault secret backup'"; stale=1; }
+    done < <(jq -r '.[].name' <<<"$toks")
 
     # Anything the conf declares that never made it into the vault at all.
     if conf_load soft && (( ${#KV_SOURCES[@]} > 0 )); then
@@ -1621,6 +1749,23 @@ cmd_restore() {
                 ;;
 
             secret)
+                local token; token="$(jq -r '.meta.token // ""' <<<"$it")"
+                if [[ -n $token ]]; then      # a `keyvault secret` copy: back into `secret`
+                    local sb ask; ask="$(jq -r '.meta.ask // "false"' <<<"$it")"
+                    if ! sb="$(secret_bin)"; then
+                        bad "$id  the 'secret' tool is not installed — keyvault show $id --out FILE has it"; rc=1; continue
+                    fi
+                    if tokens_list | jq -e --arg n "$token" 'any(.[]; .name == $n)' >/dev/null && (( ! force )); then
+                        note "$id  $token is already in 'secret' — --force replaces it"; continue
+                    fi
+                    say "$(act)store $token with 'secret'$([[ $ask == true ]] && echo ' (--ask)')"
+                    if (( apply )); then
+                        # shellcheck disable=SC2046
+                        "$sb" set "$token" --stdin --desc "$(jq -r '.desc // ""' <<<"$it")" $([[ $ask == true ]] && echo --ask) \
+                            <"$full" >/dev/null 2>&1 && ok "$id  stored" || { bad "$id  could not store $token"; rc=1; }
+                    fi
+                    continue
+                fi
                 local path; path="$(jq -r '.path // ""' <<<"$it")"
                 if [[ -n $path ]]; then
                     path="$(untildify "$path")"
@@ -2045,6 +2190,12 @@ ${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
   remove <id>                 take an added item out
   show <id> --out PATH        write one item back out
 
+${C_BOLD}TOKENS — the 'secret' tool, backed up${C_RESET}
+  secret set NAME [--ask] [--desc T] [--stdin]   store a token, and seal a copy in the vault
+  secret rm NAME              remove it, and its copy
+  secret backup               copy the tokens stored with plain 'secret' (once)
+  secret run NAME -- <cmd…>   run with it in the environment (list, get: as 'secret')
+
 ${C_BOLD}PUTTING IT BACK${C_RESET}
   restore [--only ID] [--force] [--apply]     dry run unless --apply
 
@@ -2052,9 +2203,9 @@ ${C_BOLD}PUTTING IT BACK${C_RESET}
   --via DEVICE (which device unlocks the biometric key; default: mac).
 
 ${C_BOLD}FOR AGENTS — WHAT EXISTS (asks for nothing, no secrets)${C_RESET}
-  catalog [--json]            every item with its level and public facts
+  catalog [--json]            every vault item and 'secret' token, with its level and public facts
   find <text> [--json]        search ids, descriptions and metadata
-  describe <id>               everything known about one item, and how to borrow it
+  describe <id>               everything known about one item, and how to borrow or use it
 
 ${C_BOLD}FOR AGENTS — BORROWING (a human approves each loan)${C_RESET}
   request <id>… --reason TEXT [--ttl 30m]   ask; prints the approve command for the human
@@ -2097,6 +2248,7 @@ main() {
         card)               cmd_card "$@" ;;
         setup)              cmd_setup "$@" ;;
         recovery-check)     cmd_recovery_check "$@" ;;
+        secret)             cmd_secret "$@" ;;
         open|close|abort)   die "'$cmd' is gone in 2.0: writes never ask for anything any more, so there is no session to hold open" ;;
         status)             cmd_status ;;
         doctor)             cmd_doctor "$@" ;;
