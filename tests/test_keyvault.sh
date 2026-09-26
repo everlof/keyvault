@@ -105,6 +105,14 @@ check "untildify expands ~" "$out" "$HOME/a/b"
 out="$(KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; tildify /etc/hosts")"
 check "tildify leaves other paths alone" "$out" "/etc/hosts"
 
+group "Unit: random passwords"
+# Started by something that ignores SIGPIPE (the notty wrapper is Python, which does),
+# `tr </dev/urandom | head` never ended and hung every identities export.
+out="$(perl -e 'alarm 20; exec @ARGV' "${NOTTY[@]}" env KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; random_password")"; rc=$?
+pkill -f 'tr -dc A-Za-z0-9' 2>/dev/null    # what a hang leaves behind
+check "random_password ends even with SIGPIPE ignored" "$rc" "0"
+check "and is 40 characters" "${#out}" "40"
+
 group "Unit: keyvault's own output is never collected"
 mkdir -p "$WORK/dest/keyvault/added" "$WORK/dest/archive/1"
 for f in catalog.json README.txt keyvault/biometric.age keyvault/added/x.both.age archive/1/both.age; do
@@ -444,14 +452,14 @@ group "the vault opens with nothing but age, tar and the recovery key"
 # Exactly the recipe on the card and in the README, run by hand.
 mkdir -p "$WORK/manual" && cp -R "$STORE" "$WORK/manual/" && (
     cd "$WORK/manual/keyvault" && cp "$WORK/recovery.id" ../r.txt
-    for f in *.age added/*.age; do
-        [[ -f $f ]] || continue
+    for f in *.age keychain/*.age added/*.age; do
+        [ -f "$f" ] || continue
         cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
         tar -xzf x; mv vault "vault-$(basename "$f" .age)"
     done
     rm -f x ../r.txt
 )
-check "every file opened" "$(ls -d "$WORK/manual/keyvault"/vault-*/ 2>/dev/null | wc -l | tr -d ' ')" "$(ls "$STORE"/*.age "$STORE"/added/*.age 2>/dev/null | wc -l | tr -d ' ')"
+check "every file opened" "$(ls -d "$WORK/manual/keyvault"/vault-*/ 2>/dev/null | wc -l | tr -d ' ')" "$(ls "$STORE"/*.age "$STORE"/keychain/*.age "$STORE"/added/*.age 2>/dev/null | wc -l | tr -d ' ')"
 grep -rq 'PRIVATE-KEY-ALPHA' "$WORK/manual/keyvault"/vault-both/items 2>/dev/null \
     && ok "the both level, two layers deep, is readable" || no "the both level, two layers deep, is readable"
 jq -e '[.items[] | select(.type=="file")] | length > 0' "$WORK/manual/keyvault/vault-biometric/manifest.json" >/dev/null 2>&1 \
@@ -691,6 +699,89 @@ gid="$(grep -oE 'kv-[a-f0-9]{8}' <<<"$out" | head -1)"
 check "grant creates an active loan in one step" "$(jq -r .status "$A/state/grants/$gid.json" 2>/dev/null)" "active"
 agent revoke --all >/dev/null 2>&1
 check "revoke --all leaves nothing on loan" "$(ls "$A/state/grants" | wc -l | tr -d ' ')" "0"
+
+# ---------------------------------------------------------------------------- keychain identities
+#
+# A fake `security` stands in for the keychain and counts exports: each real one costs a
+# macOS prompt per private key, and "Always Allow" does not stick for exports.
+
+I="$WORK/ident"
+mkdir -p "$I/bin" "$I/dest" "$I/state" "$I/keys"
+cat > "$I/bin/security" <<'EOF'
+#!/bin/bash
+case "$1" in
+    find-identity) cat "$FAKE_SEC/identities" ;;
+    find-certificate) exit 0 ;;
+    export) out=""; while (($#)); do [[ $1 == -o ]] && out="$2"; shift; done
+            echo x >> "$FAKE_SEC/exports"; printf 'FAKE P12\n' > "$out" ;;
+    *) exit 1 ;;
+esac
+EOF
+chmod +x "$I/bin/security"
+printf '  1) %s "Developer ID Application: Test (ABCDE12345)"\n  2) %s "Apple Distribution: Test (ABCDE12345)"\n     2 valid identities found\n' \
+    0123456789ABCDEF0123456789ABCDEF01234567 89ABCDEF0123456789ABCDEF0123456789ABCDEF > "$I/identities"
+: > "$I/exports"
+# A key whose password is lost: openssl would ask for it on the terminal.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -aes-256-cbc -pass pass:gone -out "$I/keys/locked.pem" 2>/dev/null
+printf 'PRIVATE-KEY-GAMMA\n' > "$I/keys/gamma.key"
+chmod 600 "$I/keys"/*
+cat > "$I/keyvault.conf" <<EOF
+identities test.keychain-db --level both --desc "signing identities"
+file "$I/keys/gamma.key" --id gamma --level both
+file "$I/keys/locked.pem" --id locked
+EOF
+ienv() { env PATH="$I/bin:$PATH" FAKE_SEC="$I" KEYVAULT_CONF="$I/keyvault.conf" KEYVAULT_DEST="$I/dest" \
+         KEYVAULT_STATE="$I/state" KEYVAULT_MOUNT="$I/mount" KEYVAULT_NO_NOTIFY=1 "$@"; }
+ikv()  { ienv "${NOTTY[@]}" "$SHELL_BIN" "$KV" "$@"; }
+exports() { grep -c . "$I/exports" | tr -d ' '; }
+IFILE="$I/dest/keyvault/keychain/identities-test.both.age"
+
+group "Keychain identities: exported only when they changed"
+# Through a terminal, where openssl would stop and ask for locked.pem's password.
+out="$(ienv perl -e 'alarm 60; exec @ARGV' python3 "$ROOT/tests/onpty.py" "" "$SHELL_BIN" "$KV" pack 2>&1)"; rc=$?
+check "pack never stops for a protected key's password" "$rc" "0"
+grep -q 'locked  is password-protected' <<<"$out" && ok "it warns that the password is not in the vault" || no "it warns that the password is not in the vault" "$out"
+check "the catalog marks it protected" "$(jq -r '.items[] | select(.id=="locked") | .meta.encrypted' "$I/dest/catalog.json")" "true"
+check "the first pack exports" "$(exports)" "1"
+[[ -f $IFILE ]] && ok "identities are sealed in a file of their own" || no "identities are sealed in a file of their own" "$(ls -R "$I/dest/keyvault")"
+age -d -i "$WORK/recovery.id" "$I/dest/keyvault/both.age" 2>/dev/null | age -d -i "$WORK/recovery.id" 2>/dev/null | tar -tzf - 2>/dev/null | grep -q 'items/identities-test' \
+    && no "and not in the level file" || ok "and not in the level file"
+before="$(shasum -a 256 "$IFILE")"
+out="$(ikv pack 2>&1)"; rc=$?
+check "an unchanged keychain packs" "$rc" "0"
+check "without exporting again" "$(exports)" "1"
+grep -q 'kept without exporting' <<<"$out" && ok "and says so" || no "and says so" "$out"
+check "the sealed copy is untouched" "$(shasum -a 256 "$IFILE")" "$before"
+check "the catalog still lists its certificates" "$(jq -r '.items[] | select(.id=="identities-test") | .certs | length' "$I/dest/catalog.json")" "2"
+out="$(ikv restore --only identities-test 2>&1)"
+grep -q 'would import 2 identities' <<<"$out" && ok "restore --only reads the kept file" || no "restore --only reads the kept file" "$out"
+ikv verify >/dev/null 2>&1
+check "verify reads it along with the rest" "$?" "0"
+ikv pack --refresh >/dev/null 2>&1
+check "pack --refresh exports anyway" "$(exports)" "2"
+printf '  3) %s "Apple Development: Test (ABCDE12345)"\n' FEDCBA9876543210FEDCBA9876543210FEDCBA98 >> "$I/identities"
+ikv pack >/dev/null 2>&1
+check "a new identity in the keychain means a new export" "$(exports)" "3"
+check "and the catalog follows" "$(jq -r '.items[] | select(.id=="identities-test") | .certs | length' "$I/dest/catalog.json")" "3"
+sed -i '' 's/--desc "signing identities"/--desc "all signing identities"/' "$I/keyvault.conf"
+ikv pack >/dev/null 2>&1
+check "a changed description means a new export" "$(exports)" "4"
+mkdir -p "$I/manual" && cp -R "$I/dest/keyvault" "$I/manual/" && (
+    cd "$I/manual/keyvault" && cp "$WORK/recovery.id" ../r.txt
+    for f in *.age keychain/*.age added/*.age; do
+        [ -f "$f" ] || continue
+        cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+        tar -xzf x; mv vault "vault-$(basename "$f" .age)"
+    done
+    rm -f x ../r.txt
+)
+[[ -f $I/manual/keyvault/vault-identities-test.both/items/identities-test/identities.p12 ]] \
+    && ok "the recipe on the card opens keychain/ too" || no "the recipe on the card opens keychain/ too" "$(ls "$I/manual/keyvault")"
+sed -i '' '/^identities /d' "$I/keyvault.conf"
+ikv pack >/dev/null 2>&1
+[[ -e $IFILE ]] && no "dropping the line drops its file" || ok "dropping the line drops its file"
+jq -e 'any(.items[]; .id == "identities-test")' "$I/dest/catalog.json" >/dev/null \
+    && no "and its catalog entry" || ok "and its catalog entry"
 
 # ---------------------------------------------------------------------------- ramdisk
 

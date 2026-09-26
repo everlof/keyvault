@@ -29,7 +29,8 @@
 #
 #   identities <keychain> [--desc TEXT] [--level L]
 #       Every code-signing identity (certificate + private key) in a keychain, exported
-#       as one .p12. macOS asks once per key — click Allow.
+#       as one .p12. macOS asks once per key — click Allow. Later packs export again only
+#       when the keychain's identities change (or with `pack --refresh`).
 #
 #   file <path> [--id NAME] [--desc TEXT] [--level L]
 #       One file, restored to the same path with the same mode.

@@ -133,7 +133,8 @@ You need the recovery key, and nothing but `age`:
 brew install age
 printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt
 cd Keyvault/keyvault
-for f in *.age added/*.age; do
+for f in *.age keychain/*.age added/*.age; do
+    [ -f "$f" ] || continue
     cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
     tar -xzf x; mv vault "vault-$(basename "$f" .age)"
 done
@@ -155,6 +156,11 @@ keyvault falls back to a `700` temp directory and says so loudly.
 
 A pack is all or nothing: if any source fails, nothing on disk changes. Every change first
 copies the vault to `archive/`, which keeps the last ten.
+
+Exporting signing identities costs one macOS prompt per private key, every time; "Always
+Allow" does not stick for exports. So each `identities` line is sealed in a file of its own
+(`keychain/`), and `pack` exports again only when the keychain's identities differ from the
+ones in the vault. `pack --refresh` exports anyway.
 
 ## Agents: knowing what exists, borrowing what they need
 
@@ -275,7 +281,7 @@ sandbox holds against that. Rules still stop the accidental read, which is the c
 
 ```
 keyvault init | setup | edit | doctor | status | card | recovery-check
-keyvault pack | list | verify | validate
+keyvault pack [--refresh] | list | verify | validate
 keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
 keyvault remove <id> | show <id> --out PATH
 keyvault restore [--only ID] [--force] [--apply]

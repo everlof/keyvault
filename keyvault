@@ -66,6 +66,7 @@ KV_DEST="${KEYVAULT_DEST:-}"
 [[ -n $KV_DEST ]] || KV_DEST="$KV_DEST_DEFAULT"
 readonly KV_DEST
 readonly KV_STORE="$KV_DEST/keyvault"        # one encrypted file per level
+readonly KV_KEYCHAIN="$KV_STORE/keychain"    # one per `identities` line: exported only when it changes
 readonly KV_ADDED="$KV_STORE/added"          # one per item added by hand
 readonly KV_CATALOG="$KV_DEST/catalog.json"
 readonly KV_ARCHIVE="$KV_DEST/archive"
@@ -145,7 +146,8 @@ resolve_path() {
     printf '%s\n' "$p"
 }
 
-random_password() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40; }
+# Bounded input: with SIGPIPE ignored by whoever started us, `tr </dev/urandom` never ends.
+random_password() { head -c 1024 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 40; }
 
 # Sparkle's own tools, wherever SPM last unpacked them. Only pack/restore need these;
 # verify derives public keys itself, so a machine without Xcode can still check a vault.
@@ -417,15 +419,22 @@ ws_close() {
 #
 # <dest>/keyvault/
 #     biometric.age  passphrase.age  both.age     what keyvault.conf declares, by level
+#     keychain/<id>.<level>.age                    each `identities` line, on its own
 #     added/<id>.<level>.age                       each item added by hand, on its own
 #
-# Declared items are rebuilt by every pack; added ones are only touched by add/remove.
-# Neither needs to read the other, so no write ever needs a factor.
+# Declared items are rebuilt by every pack, except keychain identities while the keychain
+# still holds exactly the same ones; added items are only touched by add/remove. None
+# needs to read another, so no write ever needs a factor.
 
 store_files() {   # "<level>\t<path>\t<adhoc>" per file
     local l f b
     for l in $KV_LEVELS; do
         [[ -f $KV_STORE/$l.age ]] && printf '%s\t%s\tfalse\n' "$l" "$KV_STORE/$l.age"
+    done
+    for f in "$KV_KEYCHAIN"/*.age; do
+        [[ -f $f ]] || continue
+        b="$(basename "$f" .age)"
+        printf '%s\t%s\tfalse\n' "${b##*.}" "$f"
     done
     for f in "$KV_ADDED"/*.age; do
         [[ -f $f ]] || continue
@@ -436,6 +445,7 @@ store_files() {   # "<level>\t<path>\t<adhoc>" per file
 }
 store_exists() { [[ -n $(store_files) ]]; }
 added_file()   { local f; for f in "$KV_ADDED/$1".*.age; do [[ -f $f ]] && { printf '%s\n' "$f"; return 0; }; done; return 1; }
+keychain_file() { local l; for l in $KV_LEVELS; do [[ -f $KV_KEYCHAIN/$1.$l.age ]] && { printf '%s\n' "$KV_KEYCHAIN/$1.$l.age"; return 0; }; done; return 1; }
 
 # Copy the whole store aside before any change: a bad pack or add is recoverable, and
 # only the last KV_ARCHIVE_KEEP snapshots are kept.
@@ -462,6 +472,9 @@ vault_load() {
             if f="$(added_file "$id")"; then
                 l="$(basename "$f" .age)"; l="${l##*.}"
                 row="$l"$'\t'"$f"$'\t'true
+            elif f="$(keychain_file "$id")"; then
+                l="$(basename "$f" .age)"; l="${l##*.}"
+                row="$l"$'\t'"$f"$'\t'false
             else
                 # Declared items: the catalog says which level file holds them. A wrong
                 # catalog only costs a "not in the vault" below — never access.
@@ -640,7 +653,9 @@ conf_load() {
 # what lets an agent find "the ASC key for team X" without being able to read it.
 
 pubkey_sha256() {   # base64 SHA-256 of the DER public key — the form GitHub and Apple show
-    openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64
+    # An empty -passin: openssl otherwise asks for a protected key's password on the
+    # terminal, in the middle of a pack. Such a key simply gets no fingerprint.
+    openssl pkey -in "$1" -passin pass: -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64
 }
 
 file_meta() {   # file_meta <path>  -> {"kind":…, "meta":{…}}
@@ -666,7 +681,9 @@ file_meta() {   # file_meta <path>  -> {"kind":…, "meta":{…}}
     elif grep -q -- 'PRIVATE KEY-----' "$f" 2>/dev/null; then
         [[ $kind == asc-api-key ]] || kind=private-key
     fi
-    if grep -q -- 'PRIVATE KEY-----' "$f" 2>/dev/null; then
+    if grep -q -e 'ENCRYPTED PRIVATE KEY-----' -e '^Proc-Type: 4,ENCRYPTED' "$f" 2>/dev/null; then
+        add_m encrypted true
+    elif grep -q -- 'PRIVATE KEY-----' "$f" 2>/dev/null; then
         v="$(pubkey_sha256 "$f")"
         [[ -n $v && $v != "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" ]] && add_m public_key_sha256 "$v"
     fi
@@ -717,6 +734,29 @@ collect_sparkle() {
         '{id:$id, type:"sparkle", kind:"sparkle-ed25519", account:$account, public_key:$pub,
           plist:$plist, file:$file, sha256:$sha, desc:$desc, adhoc:false}')"
     ok "$id  $pub"
+}
+
+# Exporting identities costs one macOS prompt per private key, every time: "Always Allow"
+# does not stick for exports. So each `identities` line is sealed on its own, and while the
+# keychain holds exactly the identities that sealed copy was made from, pack keeps it
+# instead of exporting again. `pack --refresh` exports anyway.
+identities_id() { local k; k="$(jq -r '.keychain' <<<"$1")"; printf 'identities-%s\n' "${k%%.*}"; }
+
+identities_unchanged() {   # identities_unchanged <spec> — true when the sealed copy is current
+    local keychain id lv desc entry had live m
+    keychain="$(jq -r '.keychain' <<<"$1")"; lv="$(jq -r '.level' <<<"$1")"; desc="$(jq -r '.desc' <<<"$1")"
+    id="$(identities_id "$1")"
+    [[ -f $KV_KEYCHAIN/$id.$lv.age ]] || return 1
+    for m in ${KV_META[@]+"${KV_META[@]}"}; do
+        [[ $(jq -r '.id' <<<"$m") == "$id" ]] && return 1    # meta lives inside the sealed copy too
+    done
+    entry="$(jq -c --arg id "$id" '.items[]? | select(.id == $id and .type == "identities")' "$KV_CATALOG" 2>/dev/null)"
+    [[ -n $entry && $(jq -r '.level' <<<"$entry") == "$lv" && $(jq -r '.desc // ""' <<<"$entry") == "$desc" ]] || return 1
+    had="$(jq -r '.certs[]?.sha1' <<<"$entry" | sort -u)"
+    live="$(security find-identity -v "$keychain" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([0-9A-F]\{40\}\).*/\1/p' | sort -u)"
+    [[ -n $live && $live == "$had" ]] || return 1
+    ok "$id  unchanged, $(grep -c . <<<"$live") certificates — kept without exporting"
 }
 
 collect_identities() {
@@ -852,6 +892,9 @@ collect_file() {   # collect_file <path> <desc> [id] [adhoc]
     else
         ok "$id  $(tildify "$path")"
     fi
+    if mf_item "$id" | jq -e '.meta.encrypted == "true"' >/dev/null; then
+        warn "$id  is password-protected; the vault keeps it as it is, not its password"
+    fi
 }
 
 collect_glob() {
@@ -875,13 +918,34 @@ collect_glob() {
 # ---------------------------------------------------------------------------- pack
 #
 # Collect everything keyvault.conf declares onto the RAM disk, then encrypt one file per
-# level. Encrypting needs only public keys, so pack never asks for Touch ID or the
-# passphrase — only macOS's own Keychain prompts while collecting. All or nothing: if any
-# source fails, nothing on disk changes.
+# level, and one per `identities` line. Encrypting needs only public keys, so pack never
+# asks for Touch ID or the passphrase — only macOS's own Keychain prompts while exporting,
+# and those only when the keychain's identities changed. All or nothing: if any source
+# fails, nothing on disk changes.
+
+# pack_seal <level> <dest> <packed_at> <id>… — these items, with their slice of the
+# manifest, sealed at <level> into <dest>.new.
+pack_seal() {
+    local l="$1" dest="$2" t="$3" out="$WS/out" id rc; shift 3
+    rm -rf "$out"; mkdir -p "$out/vault/items"
+    for id in "$@"; do cp -Rp "$(item_path "items/$id")" "$out/vault/items/"; done
+    jq --arg l "$l" --arg t "$t" --arg by "$(whoami)@$(hostname -s)" --arg v "$KV_VERSION" \
+        --argjson ids "$(jq -nc '$ARGS.positional' --args -- "$@")" \
+        '.items |= map(select(.id as $i | any($ids[]; . == $i)))
+         | .level = $l | .packed_at = $t | .packed_by = $by | .tool_version = $v' \
+        "$(session_manifest)" > "$out/vault/manifest.json"
+    tar -czf "$WS/tmp/pack.tgz" -C "$out" vault && rm -rf "$out" \
+        && mkdir -p "$(dirname "$dest")" && seal "$l" "$WS/tmp/pack.tgz" "$dest.new"
+    rc=$?
+    rm -f "$WS/tmp/pack.tgz"
+    return $rc
+}
 
 cmd_pack() {
+    local refresh=0
     while (($#)); do
         case "$1" in
+            --refresh) refresh=1; shift ;;     # export keychain identities even if unchanged
             *) die "pack: unknown option '$1'" ;;
         esac
     done
@@ -892,13 +956,19 @@ cmd_pack() {
     ws_open
 
     step "Collecting"
-    local spec type failed=0
+    local spec type id failed=0 kept=() keep=()    # kept: identities ids not re-exported; keep: their files
     for spec in "${KV_SOURCES[@]}"; do
         type="$(jq -r '.type' <<<"$spec")"
         KV_CUR_LEVEL="$(jq -r '.level // "biometric"' <<<"$spec")"
         case "$type" in
             sparkle)    collect_sparkle "$spec"    || failed=1 ;;
-            identities) collect_identities "$spec" || failed=1 ;;
+            identities)
+                if (( ! refresh )) && identities_unchanged "$spec"; then
+                    id="$(identities_id "$spec")"
+                    kept+=("$id"); keep+=("$KV_KEYCHAIN/$id.$KV_CUR_LEVEL.age")
+                else
+                    collect_identities "$spec" || failed=1
+                fi ;;
             file)       collect_file "$(untildify "$(jq -r '.path' <<<"$spec")")" \
                                      "$(jq -r '.desc' <<<"$spec")" \
                                      "$(jq -r '.id'   <<<"$spec")" false || failed=1 ;;
@@ -921,7 +991,6 @@ cmd_pack() {
 
     # A declared item and a hand-added one may not share an id: restore would not know
     # which one belongs at the path.
-    local id
     for id in $(jq -r '.items[].id' "$(session_manifest)"); do
         added_file "$id" >/dev/null && { bad "$id  is declared in keyvault.conf and was also added by hand — 'keyvault remove $id' or give it an --id"; failed=1; }
     done
@@ -932,28 +1001,27 @@ cmd_pack() {
     fi
 
     step "Sealing"
-    local l n packed_at; packed_at="$(now_utc)"
+    local l n ids packed_at; packed_at="$(now_utc)"
     mkdir -p "$KV_STORE"
+    rm -f "$KV_STORE"/*.age.new "$KV_KEYCHAIN"/*.age.new
     for l in $KV_LEVELS; do
-        n="$(jq --arg l "$l" '[.items[] | select(.level == $l)] | length' "$(session_manifest)")"
-        rm -f "$KV_STORE/$l.age.new"
-        (( n )) || continue
-        local out="$WS/out/$l"
-        mkdir -p "$out/vault/items"
-        for id in $(jq -r --arg l "$l" '.items[] | select(.level == $l) | .id' "$(session_manifest)"); do
-            cp -Rp "$(item_path "items/$id")" "$out/vault/items/"
-        done
-        jq --arg l "$l" --arg t "$packed_at" --arg by "$(whoami)@$(hostname -s)" --arg v "$KV_VERSION" \
-            '.items |= map(select(.level == $l)) | .level = $l | .packed_at = $t | .packed_by = $by | .tool_version = $v' \
-            "$(session_manifest)" > "$out/vault/manifest.json"
-        tar -czf "$WS/tmp/$l.tgz" -C "$out" vault && rm -rf "$out" \
-            && seal "$l" "$WS/tmp/$l.tgz" "$KV_STORE/$l.age.new" \
-            || { rm -f "$KV_STORE"/*.age.new; die "could not seal the $l level — nothing was written"; }
-        rm -f "$WS/tmp/$l.tgz"
+        ids="$(jq -r --arg l "$l" '.items[] | select(.level == $l and .type != "identities") | .id' "$(session_manifest)")"
+        [[ -n $ids ]] || continue
+        # shellcheck disable=SC2086
+        pack_seal "$l" "$KV_STORE/$l.age" "$packed_at" $ids \
+            || { rm -f "$KV_STORE"/*.age.new "$KV_KEYCHAIN"/*.age.new; die "could not seal the $l level — nothing was written"; }
+        n="$(grep -c . <<<"$ids")"
         ok "$l  $n item$( ((n > 1)) && echo s)"
     done
+    for id in $(jq -r '.items[] | select(.type == "identities") | .id' "$(session_manifest)"); do
+        l="$(mf_item "$id" | jq -r '.level')"
+        pack_seal "$l" "$KV_KEYCHAIN/$id.$l.age" "$packed_at" "$id" \
+            || { rm -f "$KV_STORE"/*.age.new "$KV_KEYCHAIN"/*.age.new; die "could not seal $id — nothing was written"; }
+        keep+=("$KV_KEYCHAIN/$id.$l.age")
+        ok "$id  $l, in a file of its own"
+    done
 
-    # Every level sealed: only now does anything on disk change.
+    # Every file sealed: only now does anything on disk change.
     store_archive
     for l in $KV_LEVELS; do
         if [[ -f $KV_STORE/$l.age.new ]]; then
@@ -962,8 +1030,16 @@ cmd_pack() {
             rm -f "$KV_STORE/$l.age"     # nothing at this level any more
         fi
     done
+    local f
+    for f in "$KV_KEYCHAIN"/*.age.new; do
+        [[ -f $f ]] && mv -f "$f" "${f%.new}" && chmod 600 "${f%.new}"
+    done
+    for f in "$KV_KEYCHAIN"/*.age; do        # an identities line that is gone, or changed level
+        [[ -f $f ]] || continue
+        printf '%s\n' ${keep[@]+"${keep[@]}"} | grep -qxF "$f" || rm -f "$f"
+    done
 
-    catalog_write_pack "$(session_manifest)" "$packed_at"
+    catalog_write_pack "$(session_manifest)" "$packed_at" ${kept[@]+"${kept[@]}"}
     dest_readme_write
     say ""
     ok "$(tildify "$KV_STORE")"
@@ -1517,7 +1593,8 @@ cmd_card() {
 
       printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt          # the key above
       cd keyvault/
-      for f in *.age added/*.age; do
+      for f in *.age keychain/*.age added/*.age; do
+          [ -f "\$f" ] || continue
           cp "\$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
           tar -xzf x; mv vault "vault-\$(basename "\$f" .age)"
       done
@@ -1672,12 +1749,14 @@ catalog_save() {   # catalog_save <items-json> [packed_at]
         || warn "could not write $(tildify "$KV_CATALOG")"
 }
 
-# pack: declared items are replaced wholesale; hand-added ones are kept. An added file the
-# catalog has lost track of still gets a minimal entry, so list never hides it.
-catalog_write_pack() {   # catalog_write_pack <manifest> <packed_at>
+# pack: declared items are replaced wholesale; hand-added ones, and identities pack kept
+# without exporting, carry over. An added file the catalog has lost track of still gets a
+# minimal entry, so list never hides it.
+catalog_write_pack() {   # catalog_write_pack <manifest> <packed_at> [kept-id…]
     local declared kept f b known
     declared="$(catalog_public "$1")"
-    kept="$(catalog_items | jq -c '[.[] | select(.adhoc)]')"
+    kept="$(catalog_items | jq -c --argjson k "$(jq -nc '$ARGS.positional' --args -- "${@:3}")" \
+        '[.[] | select(.adhoc or (.id as $i | any($k[]; . == $i)))]')"
     for f in "$KV_ADDED"/*.age; do
         [[ -f $f ]] || continue
         b="$(basename "$f" .age)"
@@ -1703,6 +1782,7 @@ dest_readme_write() {
 This folder holds an encrypted backup of keys that cannot be re-issued.
 
     keyvault/*.age          the vault, one file per level (biometric, passphrase, both)
+    keyvault/keychain/*.age keychain identities, one file per keychain
     keyvault/added/*.age    items added by hand, one file each
     catalog.json            what is inside — public facts only, no secrets
     archive/                the previous $KV_ARCHIVE_KEEP versions
@@ -1717,7 +1797,8 @@ TO OPEN IT on any machine, with the recovery key:
     brew install age
     printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt
     cd keyvault
-    for f in *.age added/*.age; do
+    for f in *.age keychain/*.age added/*.age; do
+        [ -f "\$f" ] || continue
         cp "\$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
         tar -xzf x; mv vault "vault-\$(basename "\$f" .age)"
     done
@@ -1871,7 +1952,8 @@ ${C_BOLD}SETTING UP${C_RESET}
   doctor                      check tools, keys, config and every declared source
 
 ${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passphrase · both
-  pack                        collect what keyvault.conf declares and seal it (asks for nothing)
+  pack [--refresh]            collect what keyvault.conf declares and seal it (asks for nothing)
+                              keychain identities are exported only when they changed; --refresh forces it
   list                        what is in the vault, from the catalog (asks for nothing)
   verify                      is the vault internally sound?
   validate                    does it still match this machine?  (exit 2: out of date)
