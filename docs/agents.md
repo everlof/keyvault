@@ -1,12 +1,18 @@
 # Using keyvault as an agent
 
 This machine keeps its irreplaceable keys in keyvault: Sparkle update keys, code-signing
-identities, App Store Connect `.p8` keys, GitHub App keys, the SOPS master key. You cannot
-open it, and you should not try: it needs a passphrase only the user types.
+identities, App Store Connect `.p8` keys, GitHub App keys, the SOPS master key, recovery
+codes. You cannot open it, and you should not try. Every item has a level (`biometric`,
+`passphrase` or `both`) and only the user can unlock it: with Touch ID, with a passphrase
+typed at a terminal, or both.
+
+**Never run `age`, `age-plugin-se` or anything else against `~/.config/keyvault/keys/`.** It
+would put a Touch ID dialog on the user's screen that does not say who is asking. That is
+the one way to trick them, so don't.
 
 ## Find what you need (no permission required)
 
-    keyvault catalog            # every item: id, kind, key ids, public keys, expiry
+    keyvault catalog            # every item: id, level, kind, key ids, public keys, expiry
     keyvault find <text>        # e.g. an ASC key id, an app name, a team id
     keyvault describe <id>      # details, the $KV_ variable a grant sets, a usage example
 
@@ -53,8 +59,9 @@ in case".
 
 ## Never
 
-- Set or use `KEYVAULT_IDENTITY`, or run `open`, `show`, `restore`, `pack` or `add`.
-  Those are the user's commands.
+- Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY` or `KEYVAULT_RECOVERY_IDENTITY`,
+  or run `setup`, `show`, `restore`, `verify`, `pack`, `add` or `remove`. Those are the
+  user's commands.
 - Read `/Volumes/keyvault-*` directly, or copy granted files elsewhere.
 - Copy a key into a repo, a `.env`, a log, a chat message or a CI secret without being asked
   to, in so many words.

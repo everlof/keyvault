@@ -2,7 +2,7 @@
 # borrow specific items for a bounded time, with a human approving each loan.
 #
 #   anyone, no passphrase:   catalog · find · describe · request · grants · revoke
-#   human at a terminal:     approve · grant             (types the vault passphrase)
+#   human at a terminal:     approve · grant             (Touch ID and/or passphrase, per level)
 #   holder of a live grant:  exec · env
 #   after a one-shot run:    result
 #
@@ -11,8 +11,9 @@
 # the approval, wipes everything, and leaves only its output — the key never exists
 # outside a command the human read and accepted.
 #
-# The passphrase is the boundary. An agent has no /dev/tty, so it can neither type the
-# passphrase nor answer the approval prompt; everything it can do alone is read public
+# The human is the boundary. An agent has no /dev/tty, so it can neither answer the
+# approval prompt nor type the passphrase; Touch ID is a dialog it can raise but not
+# answer — which is why `both` exists for the keys that matter most; everything it can do alone is read public
 # metadata and file a request. What an approved grant hands over is a RAM disk holding
 # only the granted items, which unmounts itself when the grant expires or is revoked.
 #
@@ -153,8 +154,8 @@ item_line() {   # one catalog item -> one line of the table
             elif .meta.age_recipient then .meta.age_recipient
             elif .path then .path
             else "" end;
-        [.id, .kind, facts] | @tsv' <<<"$1" \
-    | awk -F'\t' '{ printf "%-40s %-20s %s\n", $1, $2, (length($3) > 60 ? substr($3, 1, 57) "..." : $3) }'
+        [.id, (.level // "?"), .kind, facts] | @tsv' <<<"$1" \
+    | awk -F'\t' '{ printf "%-38s %-11s %-20s %s\n", $1, $2, $3, (length($4) > 50 ? substr($4, 1, 47) "..." : $4) }'
 }
 
 # ---------------------------------------------------------------------------- read-only
@@ -163,7 +164,7 @@ cmd_catalog() {
     catalog_require
     if [[ ${1:-} == --json ]]; then cat "$KV_CATALOG"; return 0; fi
     say "$(dim "$(tildify "$KV_CATALOG") — packed $(jq -r '.packed_at // "?"' "$KV_CATALOG"), no secrets in here")"
-    printf '%-40s %-20s %s\n' ID KIND FACTS
+    printf '%-38s %-11s %-20s %s\n' ID LEVEL KIND FACTS
     local it
     while IFS= read -r it; do item_line "$it"; done < <(jq -c '.items[]' "$KV_CATALOG")
     say ""
@@ -298,7 +299,10 @@ confirm_tty() {
 grant_stage() {   # decrypt, copy just REC's items onto their own RAM disk
     # Sets STAGE_MOUNT, STAGE_DEV, STAGE_ENV (json {VAR: path}).
     local gid="$1"
-    auto_open nosave || return 1
+    # Decrypts only the files holding these items, so a loan asks only for the factors
+    # its items' levels need: one Touch ID for a biometric .p8, both for a Sparkle key.
+    # shellcheck disable=SC2046
+    vault_load $(jq -r '.items[]' <<<"$REC")
     local ws mount dev
     ws="$(workspace_create "$(grant_mount_for "$gid")" "$KV_GRANT_SECTORS")" || return 1
     mount="${ws%%$'\t'*}"; dev="${ws##*$'\t'}"
@@ -307,13 +311,13 @@ grant_stage() {   # decrypt, copy just REC's items onto their own RAM disk
     for id in $(jq -r '.items[]' <<<"$REC"); do
         it="$(mf_item "$id")"
         if [[ -z $it ]]; then
-            workspace_destroy "$mount" "$dev"; auto_finish
+            workspace_destroy "$mount" "$dev"; ws_close
             die "'$id' is in the catalog but not in the vault — the catalog is stale; run 'keyvault pack'"
         fi
         src="$(session_dir)/$(jq -r '.file' <<<"$it")"
         mkdir -p "$mount/$id"
         dst="$mount/$id/$(basename "$src")"
-        cp "$src" "$dst" && chmod 600 "$dst" || { workspace_destroy "$mount" "$dev"; auto_finish; die "copy of $id failed"; }
+        cp "$src" "$dst" && chmod 600 "$dst" || { workspace_destroy "$mount" "$dev"; ws_close; die "copy of $id failed"; }
         var="$(env_name "$id")"
         env="$(jq -c --arg k "$var" --arg v "$dst" '. + {($k): $v}' <<<"$env")"
         if [[ $(jq -r '.type' <<<"$it") == identities ]]; then
@@ -321,7 +325,7 @@ grant_stage() {   # decrypt, copy just REC's items onto their own RAM disk
             env="$(jq -c --arg k "${var}_PASSWORD_FILE" --arg v "$mount/$id/password" '. + {($k): $v}' <<<"$env")"
         fi
     done
-    auto_finish     # the full vault is gone from memory before anything is handed out
+    ws_close        # the decrypted vault is gone before anything is handed out
     STAGE_MOUNT="$mount"; STAGE_DEV="$dev"; STAGE_ENV="$env"
 }
 
@@ -422,9 +426,16 @@ approve_one() {   # approve_one <gid> [ttl-override]
         say "  for     $(human_duration "$ttl")"
     fi
     local id
+    local lv levels=""
     for id in $(jq -r '.items[]' <<<"$REC"); do
-        say "  item    $id  $(dim "$(jq -r --arg id "$id" '.items[] | select(.id == $id) | .desc // ""' "$KV_CATALOG")")"
+        lv="$(jq -r --arg id "$id" '.items[] | select(.id == $id) | .level // "?"' "$KV_CATALOG")"
+        levels="$levels $lv"
+        say "  item    $id  [$lv]  $(dim "$(jq -r --arg id "$id" '.items[] | select(.id == $id) | .desc // ""' "$KV_CATALOG")")"
     done
+    local asks=""
+    case "$levels" in *both*|*biometric*) asks="Touch ID" ;; esac
+    case "$levels" in *both*|*passphrase*) asks="${asks:+$asks and }your passphrase" ;; esac
+    [[ -n $asks ]] && say "  unlock  $asks"
     if ! confirm_tty "Grant this?"; then
         grant_drop "$gid" denied
         say "denied"
@@ -446,6 +457,7 @@ cmd_approve() {
     while (($#)); do
         case "$1" in
             --ttl) ttl="$(ttl_seconds "$2")" || die "--ttl wants e.g. 20m or 2h, at most 12h"; shift 2 ;;
+            --via) KV_VIA="$2"; shift 2 ;;
             -*)    die "approve: unknown option '$1'" ;;
             *)     gid="$1"; shift ;;
         esac

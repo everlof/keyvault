@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# keyvault — one encrypted artifact holding every key this machine cannot re-issue.
+# keyvault — an encrypted backup of every key this machine cannot re-issue.
 #
 # The whole tool is this one bash file on purpose. It is a *recovery* tool: the day you
 # need it most is the day you are staring at a fresh Mac with no Xcode, no toolchain and
@@ -9,7 +9,8 @@
 # See README.md for the model. The short version:
 #
 #   keyvault init              create ~/.config/keyvault/keyvault.conf from the example
-#   keyvault pack              collect what keyvault.conf declares -> <dest>/keyvault.age
+#   keyvault setup             create the three keys: biometric, passphrase, recovery
+#   keyvault pack              collect what keyvault.conf declares -> <dest>/keyvault/
 #   keyvault validate          does the vault still match this machine?
 #   keyvault verify            is the vault internally sound? (offline, no keychain)
 #   keyvault add / remove      put one more thing in, take one thing out
@@ -22,8 +23,8 @@
 #
 set -uo pipefail
 
-readonly KV_VERSION="1.0.0"
-readonly KV_MANIFEST_VERSION=1
+readonly KV_VERSION="2.0.0"
+readonly KV_MANIFEST_VERSION=2
 
 # ---------------------------------------------------------------------------- paths
 
@@ -42,17 +43,19 @@ readonly KV_ROOT="$(kv_script_dir)"
 # outside the repository, and the repository ships only keyvault.conf.example.
 readonly KV_CONF="${KEYVAULT_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/keyvault/keyvault.conf}"
 readonly KV_STATE="${KEYVAULT_STATE:-$HOME/.local/state/keyvault}"
-readonly KV_SESSION="$KV_STATE/session.json"
+# The keys that open the vault — or rather, the keys wrapped by what opens it: Touch ID,
+# your passphrase. Useless off this machine; the recovery key covers that case.
+readonly KV_KEYS="${KEYVAULT_KEYS:-$(dirname "$KV_CONF")/keys}"
 
 readonly KV_DEST_DEFAULT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Keyvault"
 
-# `dest PATH` in the config says where the artifact lives. The config is sourced for real
+# `dest PATH` in the config says where the vault lives. The config is sourced for real
 # only when a command needs the sources, so read just this one line here, in a subshell
 # where every other directive is a no-op.
 conf_dest() {
     [[ -f $KV_CONF ]] || return 0
     (
-        sparkle() { :; }; identities() { :; }; file() { :; }; glob() { :; }; meta() { :; }
+        sparkle() { :; }; identities() { :; }; file() { :; }; glob() { :; }; meta() { :; }; level() { :; }
         dest() { printf '%s\n' "$1" >&3; }      # fd 3: the config's own output is discarded
         # shellcheck disable=SC1090
         source "$KV_CONF" 3>&1 >/dev/null 2>&1
@@ -62,23 +65,27 @@ KV_DEST="${KEYVAULT_DEST:-}"
 [[ -n $KV_DEST ]] || KV_DEST="$(conf_dest)"
 [[ -n $KV_DEST ]] || KV_DEST="$KV_DEST_DEFAULT"
 readonly KV_DEST
-readonly KV_ARTIFACT="$KV_DEST/keyvault.age"
+readonly KV_STORE="$KV_DEST/keyvault"        # one encrypted file per level
+readonly KV_ADDED="$KV_STORE/added"          # one per item added by hand
 readonly KV_CATALOG="$KV_DEST/catalog.json"
 readonly KV_ARCHIVE="$KV_DEST/archive"
 readonly KV_ARCHIVE_KEEP="${KEYVAULT_ARCHIVE_KEEP:-10}"
 
+# Every item has a level: what it takes to open it.
+#   biometric    Touch ID on this Mac (and, later, Face ID on a paired iPhone)
+#   passphrase   the passphrase you type
+#   both         both of the above
+# Any level also opens with the recovery key, which lives on paper, not on this machine.
+readonly KV_LEVELS="biometric passphrase both"
+KV_LEVEL_DEFAULT="biometric"                 # `level` in the config changes it
+KV_RECOVERY=0                                # --recovery: open with the paper key instead
+# Which device unlocks the biometric factor. One key, wrapped once per device, so adding a
+# device never means re-encrypting the vault.
+KV_VIA="${KEYVAULT_UNLOCK_VIA:-mac}"
+
 readonly KV_MOUNT="${KEYVAULT_MOUNT:-/Volumes/keyvault-session}"
 readonly KV_RAMDISK_SECTORS="${KEYVAULT_RAMDISK_SECTORS:-262144}"   # 512-byte sectors -> 128 MB
 readonly KV_NO_RAMDISK="${KEYVAULT_NO_RAMDISK:-0}"                  # tests exercise the fallback
-
-# An age identity file makes every operation non-interactive. Unset (the default) means
-# passphrase mode, which is the right default for a human: an identity file is itself a
-# secret you would then have to back up somewhere, and that is the problem we came to solve.
-KV_IDENTITY="${KEYVAULT_IDENTITY:-}"
-
-# Set by commands that opened a session implicitly, so the exit trap knows to close it.
-KV_AUTO_OPENED=0
-KV_AUTO_SAVE=0
 
 # ---------------------------------------------------------------------------- output
 
@@ -231,151 +238,266 @@ workspace_destroy() {
     fi
 }
 
-# ---------------------------------------------------------------------------- age
+# ---------------------------------------------------------------------------- keys
+#
+# Three factors, three age keys:
+#
+#   biometric    an age key wrapped by the Secure Enclave (age-plugin-se): Touch ID
+#                unwraps it. One wrap per device — keys/biometric.<device>.age — so a
+#                paired iPhone (Face ID) can become one more way to unwrap the same key.
+#   passphrase   an age key wrapped with your passphrase (scrypt).
+#   recovery     an age key that is never stored on this machine: it lives on paper.
+#
+# The vault is encrypted to the public halves, so writing it (pack, add, remove) never
+# asks for anything. Reading unwraps each factor it needs once per command, onto the
+# RAM disk, and every layer of every file is also encrypted to the recovery key.
 
-age_require() {
-    have age || die "age is not installed — run: brew install age"
+recipient_of() { awk -v f="$1" '$1 == f { print $2 }' "$KV_KEYS/recipients" 2>/dev/null; }
+keys_ready()   { [[ -n $(recipient_of recovery) && -n $(recipient_of biometric) && -n $(recipient_of passphrase) ]]; }
+keys_require() { keys_ready || die "no keys yet — run 'keyvault setup' first"; }
+
+level_ok()     { case "$1" in biometric|passphrase|both) return 0 ;; esac; return 1; }
+level_layers() {   # the factors a level is sealed with, innermost first
+    case "$1" in
+        biometric)  echo biometric ;;
+        passphrase) echo passphrase ;;
+        both)       echo "biometric passphrase" ;;
+    esac
 }
 
-age_encrypt() {   # age_encrypt <outfile>   (data on stdin)
-    age_require
-    if [[ -n $KV_IDENTITY ]]; then
-        local recipient
-        recipient="$(age-keygen -y "$KV_IDENTITY" 2>/dev/null)" \
-            || die "cannot read an age identity from $KV_IDENTITY"
-        age --armor --recipient "$recipient" --output "$1"
+age_require() { have age || die "age is not installed — run: brew install age"; }
+
+# Where a factor's unwrapped identity sits for the rest of this command.
+factor_path() { printf '%s/keys/%s\n' "$WS" "$1"; }
+
+factor_unlock() {   # factor_unlock <biometric|passphrase|recovery>
+    local f="$1" out; out="$(factor_path "$1")"
+    [[ -s $out ]] && return 0
+    case "$f" in
+        biometric)
+            local wrap="$KV_KEYS/biometric.$KV_VIA.age" id="${KEYVAULT_SE_IDENTITY:-$KV_KEYS/biometric.$KV_VIA.identity}"
+            [[ -f $wrap ]] || die "no biometric key for '$KV_VIA' — run 'keyvault setup'"
+            [[ -n ${KEYVAULT_SE_IDENTITY:-} ]] || info "  ${C_BOLD}Touch ID${C_RESET} to unlock the biometric key ($KV_VIA)"
+            ( umask 077; age -d -i "$id" -o "$out" "$wrap" ) 2>/dev/null \
+                || { rm -f "$out"; die "the biometric unlock failed or was cancelled"; }
+            ;;
+        passphrase)
+            local wrap="$KV_KEYS/passphrase.key.age"
+            [[ -f $wrap ]] || die "no passphrase key — run 'keyvault setup'"
+            if [[ -n ${KEYVAULT_PASSPHRASE_IDENTITY:-} ]]; then      # tests and automation only
+                ( umask 077; age -d -i "$KEYVAULT_PASSPHRASE_IDENTITY" -o "$out" "$wrap" )
+            else
+                { : </dev/tty; } 2>/dev/null || die "the passphrase needs a human at a terminal"
+                info "  ${C_BOLD}passphrase${C_RESET} to unlock the passphrase key"
+                ( umask 077; age -d -o "$out" "$wrap" )
+            fi || { rm -f "$out"; die "wrong passphrase, or it was cancelled"; }
+            ;;
+        recovery)
+            if [[ -n ${KEYVAULT_RECOVERY_IDENTITY:-} ]]; then
+                ( umask 077; cp "$KEYVAULT_RECOVERY_IDENTITY" "$out" ) || die "cannot read $KEYVAULT_RECOVERY_IDENTITY"
+            else
+                { exec 4</dev/tty; } 2>/dev/null || die "the recovery key needs a human at a terminal"
+                local k
+                printf 'Recovery key (AGE-SECRET-KEY-1…, not echoed): ' >/dev/tty
+                IFS= read -rs k <&4; printf '\n' >/dev/tty; exec 4<&-
+                # Typed from paper: forgive spaces, line breaks and lower case.
+                k="$(printf '%s' "$k" | tr -d ' \t\r\n-' | tr '[:lower:]' '[:upper:]')"
+                k="AGE-SECRET-KEY-${k#AGESECRETKEY}"
+                [[ $k == AGE-SECRET-KEY-1* ]] || die "that is not an age secret key"
+                ( umask 077; printf '%s\n' "$k" > "$out" )
+            fi
+            local want; want="$(recipient_of recovery)"
+            if [[ -n $want && "$(age-keygen -y "$out" 2>/dev/null)" != "$want" ]]; then
+                rm -f "$out"; die "that is not the recovery key this vault was made with"
+            fi
+            ;;
+    esac
+}
+
+# seal <level> <plaintext-file> <out> — one age layer per factor, each also to recovery.
+seal() {
+    local level="$1" cur="$2" out="$3" f r n=0 next rec
+    rec="$(recipient_of recovery)"
+    for f in $(level_layers "$level"); do
+        r="$(recipient_of "$f")"
+        next="$WS/tmp/seal.$$.$((++n))"
+        age --armor -r "$r" -r "$rec" -o "$next" "$cur" || return 1
+        [[ $cur == "$2" ]] || rm -f "$cur"
+        cur="$next"
+    done
+    mv -f "$cur" "$out"
+}
+
+# unseal <file> <level> <dir> — peel every layer with the factors (or the recovery key)
+# and untar into <dir>.
+unseal() {
+    local src="$1" level="$2" dir="$3" cur n=0 f ids=()
+    if (( KV_RECOVERY )); then
+        factor_unlock recovery; ids=(-i "$(factor_path recovery)")
     else
-        age --armor --passphrase --output "$1"
+        for f in $(level_layers "$level"); do factor_unlock "$f"; ids+=(-i "$(factor_path "$f")"); done
     fi
+    cur="$src"
+    while head -c 40 "$cur" | grep -q 'BEGIN AGE ENCRYPTED FILE'; do
+        (( n < 4 )) || die "$(tildify "$src"): more layers than any level has"
+        n=$((n + 1))
+        age -d "${ids[@]}" -o "$WS/tmp/peel.$n" "$cur" 2>/dev/null \
+            || die "could not decrypt $(tildify "$src") — is it this vault's, and at level $level?"
+        [[ $cur == "$src" ]] || rm -f "$cur"
+        cur="$WS/tmp/peel.$n"
+    done
+    mkdir -p "$dir"
+    tar -xzf "$cur" -C "$dir" 2>/dev/null || die "$(tildify "$src") decrypted but is not a keyvault archive"
+    [[ $cur == "$src" ]] || rm -f "$cur"
 }
 
-age_decrypt() {   # age_decrypt <infile>    (plaintext on stdout)
-    age_require
-    if [[ -n $KV_IDENTITY ]]; then
-        age --decrypt --identity "$KV_IDENTITY" "$1"
-    else
-        age --decrypt "$1"
+# ---------------------------------------------------------------------------- workspace
+#
+# Plaintext lives on a RAM disk and nowhere else. `diskutil erasevolume` on a ram:// device
+# needs no sudo, and the volume cannot survive a reboot — which is the one guarantee a
+# temp directory on an SSD can never give you.
+
+workspace_create() {   # workspace_create [mount] [sectors] [pinned]  -> "<mount>\t<device>"
+    local want="${1:-$KV_MOUNT}" sectors="${2:-$KV_RAMDISK_SECTORS}" pinned="${3:-}"
+    [[ -n $pinned ]] || { [[ -n ${KEYVAULT_MOUNT:-} ]] && pinned=1 || pinned=0; }
+    local name dev=""
+    name="$(basename "$want")"
+    if (( ! KV_NO_RAMDISK )); then
+        dev="$(hdiutil attach -nomount "ram://$sectors" 2>/dev/null | tr -d '[:space:]')"
     fi
-}
-
-# ---------------------------------------------------------------------------- session
-
-session_active() { [[ -f $KV_SESSION ]] && [[ -d $(session_get mount) ]]; }
-session_get()    { jq -r --arg k "$1" '.[$k] // ""' "$KV_SESSION" 2>/dev/null; }
-session_dir()    { printf '%s/vault\n' "$(session_get mount)"; }
-session_manifest(){ printf '%s/vault/manifest.json\n' "$(session_get mount)"; }
-
-session_open() {   # session_open [vault-path] [create]
-    session_active && die "a session is already open (keyvault status). Close or abort it first."
-
-    local src="${1:-$KV_ARTIFACT}" create="${2:-}" mount dev ws
-    # Only a command that is about to write may start from an empty vault. For anything
-    # that reads (verify, list, restore, a grant), a missing artifact is an error: an empty
-    # vault that "verifies" is a backup that lies.
-    [[ -f $src || $create == create ]] || die "no vault at $(tildify "$src") — run 'keyvault pack' first"
-    ws="$(workspace_create)" || exit 1
-    mount="${ws%%$'\t'*}"; dev="${ws##*$'\t'}"
-
-    mkdir -p "$mount/vault/items"
-
-    if [[ -f $src ]]; then
-        step "Opening $(tildify "$src")"
-        if ! age_decrypt "$src" | tar -xzf - -C "$mount"; then
-            workspace_destroy "$mount" "$dev"
-            die "could not decrypt or unpack $src (wrong passphrase?)"
-        fi
-        [[ -f $mount/vault/manifest.json ]] || {
-            workspace_destroy "$mount" "$dev"
-            die "$src decrypted, but holds no manifest.json — not a keyvault artifact"
-        }
-    else
-        step "No vault at $(tildify "$src") — starting an empty one"
-        src=""
-        jq -n --argjson v "$KV_MANIFEST_VERSION" \
-            '{version:$v, packed_at:null, items:[]}' > "$mount/vault/manifest.json"
-    fi
-
-    mkdir -p "$KV_STATE"
-    jq -n --arg m "$mount" --arg d "$dev" --arg s "$src" --arg t "$(now_utc)" \
-        --argjson fb "$([[ -z $dev ]] && echo true || echo false)" \
-        '{mount:$m, device:$d, source:$s, opened_at:$t, fallback:$fb}' > "$KV_SESSION"
-    chmod 600 "$KV_SESSION"
-}
-
-session_close() {   # re-encrypt to the artifact, then tear the workspace down
-    session_active || die "no session is open"
-    local mount dev
-    mount="$(session_get mount)"; dev="$(session_get device)"
-
-    local tmp="$mount/out.age"
-    step "Sealing"
-    if ! tar -czf - -C "$mount" vault | age_encrypt "$tmp"; then
-        die "encryption failed — the session is still open, nothing was lost. Retry, or 'keyvault abort'."
-    fi
-    [[ -s $tmp ]] || die "encryption produced an empty file — refusing to overwrite the artifact"
-
-    mkdir -p "$KV_DEST" "$KV_ARCHIVE"
-    if [[ -f $KV_ARTIFACT ]]; then
-        # Two packs in the same second must not collide — the older one is exactly the
-        # copy you would want back after a bad pack, and overwriting it loses it silently.
-        local base="$KV_ARCHIVE/keyvault-$(stamp)" prev="" n=1
-        prev="$base.age"
-        while [[ -e $prev ]]; do prev="$base-$((++n)).age"; done
-        cp -p "$KV_ARTIFACT" "$prev" || die "could not archive the previous artifact"
-    fi
-    cp "$tmp" "$KV_ARTIFACT.new" && mv -f "$KV_ARTIFACT.new" "$KV_ARTIFACT" \
-        || die "could not write $KV_ARTIFACT"
-    chmod 600 "$KV_ARTIFACT"
-
-    # Keep the last N previous versions; a bad pack is recoverable, an infinite pile is not.
-    local old
-    old="$(ls -t "$KV_ARCHIVE"/keyvault-*.age 2>/dev/null | tail -n +$((KV_ARCHIVE_KEEP + 1)))"
-    [[ -n $old ]] && printf '%s\n' "$old" | while read -r f; do rm -f "$f"; done
-
-    dest_readme_write
-    catalog_write "$(session_manifest)"
-    workspace_destroy "$mount" "$dev"
-    rm -f "$KV_SESSION"
-
-    local size
-    size="$(du -h "$KV_ARTIFACT" | awk '{print $1}')"
-    ok "$(tildify "$KV_ARTIFACT")  ($size)"
-}
-
-session_abort() {
-    session_active || die "no session is open"
-    workspace_destroy "$(session_get mount)" "$(session_get device)"
-    rm -f "$KV_SESSION"
-    ok "session discarded; the artifact on disk is untouched"
-}
-
-# One-shot commands open a session, do their work and close it. If the user opened the
-# session themselves, leave it open — they are mid-edit.
-auto_open() {   # auto_open <save|nosave>
-    if session_active; then
+    if [[ -n $dev ]] && diskutil erasevolume HFS+ "$name" "$dev" >/dev/null 2>&1; then
+        chmod 700 "/Volumes/$name" 2>/dev/null
+        printf '%s\t%s\n' "/Volumes/$name" "$dev"
         return 0
     fi
-    session_open "$KV_ARTIFACT" "$([[ $1 == save ]] && echo create)"
-    KV_AUTO_OPENED=1
-    [[ $1 == save ]] && KV_AUTO_SAVE=1
-    trap auto_finish EXIT
+    [[ -n $dev ]] && hdiutil detach "$dev" >/dev/null 2>&1
+    local tmp
+    if (( pinned )); then
+        # An explicit mount point is honoured on both paths, so a caller that pins one
+        # (the test suite does) always knows where the plaintext is.
+        tmp="$want"
+        rm -rf "$tmp" && mkdir -p "$tmp" || die "cannot create a workspace at $tmp"
+    else
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/$name.XXXXXXXX")" || die "cannot create a workspace"
+    fi
+    chmod 700 "$tmp"
+    info "${C_YELLOW}!${C_RESET} could not create a RAM disk; falling back to $tmp"
+    info "  plaintext will briefly touch this disk. It is removed on exit, but not overwritten."
+    printf '%s\t%s\n' "$tmp" ""
 }
 
-auto_finish() {
-    local rc=$?     # in the EXIT trap, the status the command is exiting with
-    trap - EXIT
-    (( KV_AUTO_OPENED )) || return 0
-    KV_AUTO_OPENED=0
-    # Reseal only on success. A command that died halfway has left the workspace in a
-    # state nobody asked for; sealing it would replace a good artifact with a broken one.
-    if (( KV_AUTO_SAVE && rc == 0 )); then
-        session_close
-    else
-        (( KV_AUTO_SAVE )) && info "nothing saved — the command failed, so the vault on disk is unchanged"
-        workspace_destroy "$(session_get mount)" "$(session_get device)"
-        rm -f "$KV_SESSION"
+workspace_destroy() {
+    local mount="$1" dev="$2"
+    if [[ -n $dev ]]; then
+        hdiutil detach "$dev" >/dev/null 2>&1 || hdiutil detach "$dev" -force >/dev/null 2>&1
+    elif [[ -n $mount && -d $mount ]]; then
+        find "$mount" -type f -exec rm -f {} + 2>/dev/null
+        rm -rf "$mount"
     fi
 }
+
+# One workspace per command, gone when the command exits — however it exits.
+WS="" WS_DEV=""
+ws_open() {
+    [[ -n $WS ]] && return 0
+    local w; w="$(workspace_create)" || exit 1
+    WS="${w%%$'\t'*}"; WS_DEV="${w##*$'\t'}"
+    mkdir -p "$WS/keys" "$WS/tmp" "$WS/vault/items"
+    chmod 700 "$WS/keys"
+    jq -n --argjson v "$KV_MANIFEST_VERSION" '{version:$v, items:[]}' > "$WS/vault/manifest.json"
+    trap ws_close EXIT
+}
+ws_close() {
+    trap - EXIT
+    [[ -n $WS ]] && workspace_destroy "$WS" "$WS_DEV"
+    WS="" WS_DEV=""
+}
+
+# ---------------------------------------------------------------------------- the store
+#
+# <dest>/keyvault/
+#     biometric.age  passphrase.age  both.age     what keyvault.conf declares, by level
+#     added/<id>.<level>.age                       each item added by hand, on its own
+#
+# Declared items are rebuilt by every pack; added ones are only touched by add/remove.
+# Neither needs to read the other, so no write ever needs a factor.
+
+store_files() {   # "<level>\t<path>\t<adhoc>" per file
+    local l f b
+    for l in $KV_LEVELS; do
+        [[ -f $KV_STORE/$l.age ]] && printf '%s\t%s\tfalse\n' "$l" "$KV_STORE/$l.age"
+    done
+    for f in "$KV_ADDED"/*.age; do
+        [[ -f $f ]] || continue
+        b="$(basename "$f" .age)"
+        printf '%s\t%s\ttrue\n' "${b##*.}" "$f"
+    done
+    return 0
+}
+store_exists() { [[ -n $(store_files) ]]; }
+added_file()   { local f; for f in "$KV_ADDED/$1".*.age; do [[ -f $f ]] && { printf '%s\n' "$f"; return 0; }; done; return 1; }
+
+# Copy the whole store aside before any change: a bad pack or add is recoverable, and
+# only the last KV_ARCHIVE_KEEP snapshots are kept.
+store_archive() {
+    store_exists || return 0
+    local dst="$KV_ARCHIVE/$(stamp)" n=1
+    while [[ -e $dst ]]; do dst="$KV_ARCHIVE/$(stamp)-$((++n))"; done
+    mkdir -p "$dst" && cp -Rp "$KV_STORE/." "$dst/" || die "could not archive the current vault"
+    local old
+    old="$(ls -1dt "$KV_ARCHIVE"/[0-9]*/ 2>/dev/null | tail -n +$((KV_ARCHIVE_KEEP + 1)))"
+    [[ -n $old ]] && printf '%s\n' "$old" | while IFS= read -r d; do rm -rf "$d"; done
+    return 0
+}
+
+# vault_load [id…] — decrypt what holds these ids (everything when none), merged into
+# one view at $WS/vault. Asks only for the factors those files need.
+vault_load() {
+    ws_open
+    store_exists || die "no vault at $(tildify "$KV_STORE") — run 'keyvault pack' first"
+    local rows want=("$@") row l f a id
+    if (( ${#want[@]} )); then
+        rows=""
+        for id in "${want[@]}"; do
+            if f="$(added_file "$id")"; then
+                l="$(basename "$f" .age)"; l="${l##*.}"
+                row="$l"$'\t'"$f"$'\t'true
+            else
+                # Declared items: the catalog says which level file holds them. A wrong
+                # catalog only costs a "not in the vault" below — never access.
+                l="$(jq -r --arg id "$id" '.items[]? | select(.id == $id) | .level // empty' "$KV_CATALOG" 2>/dev/null)"
+                level_ok "$l" && [[ -f $KV_STORE/$l.age ]] || die "'$id' is not in the vault (keyvault list)"
+                row="$l"$'\t'"$KV_STORE/$l.age"$'\t'false
+            fi
+            grep -qxF "$row" <<<"$rows" || rows="${rows:+$rows$'\n'}$row"
+        done
+    else
+        rows="$(store_files)"
+    fi
+
+    local n=0 u
+    while IFS=$'\t' read -r l f a; do
+        [[ -n $f ]] || continue
+        u="$WS/tmp/unsealed.$((++n))"
+        unseal "$f" "$l" "$u"
+        [[ -f $u/vault/manifest.json ]] || die "$(tildify "$f") holds no manifest — not a keyvault file"
+        for id in $(jq -r '.items[].id' "$u/vault/manifest.json"); do
+            mf_has "$id" && die "'$id' is in the vault twice — $(tildify "$f") and another file"
+        done
+        jq --slurpfile add "$u/vault/manifest.json" --arg l "$l" --argjson a "$a" '
+            .items += [$add[0].items[] | .level = (.level // $l) | .adhoc = $a]
+            | .packed_at = (.packed_at // $add[0].packed_at)' \
+            "$WS/vault/manifest.json" > "$WS/vault/manifest.json.new" \
+            && mv -f "$WS/vault/manifest.json.new" "$WS/vault/manifest.json"
+        [[ -d $u/vault/items ]] && for d in "$u/vault/items"/*; do [[ -e $d ]] && mv "$d" "$WS/vault/items/"; done
+        rm -rf "$u"
+    done <<<"$rows"
+    return 0
+}
+
+# Kept under their old names: everything that reads items does so through these.
+session_dir()      { printf '%s/vault\n' "$WS"; }
+session_manifest() { printf '%s/vault/manifest.json\n' "$WS"; }
 
 # ---------------------------------------------------------------------------- manifest
 
@@ -387,8 +509,11 @@ mf_write() {   # jq program + args applied to the manifest, written back atomica
 mf_item()  { jq -c --arg id "$1" '.items[] | select(.id == $id)' "$(session_manifest)"; }
 mf_has()   { [[ -n $(mf_item "$1") ]]; }
 
+KV_CUR_LEVEL=""   # the level of the spec being collected; stamped onto what it produces
 mf_put() {   # mf_put <json-object>   — replace by id, else append
-    mf_write --argjson it "$1" '.items = ((.items | map(select(.id != $it.id))) + [$it])'
+    mf_write --argjson it "$1" --arg lv "$KV_CUR_LEVEL" \
+        '.items = ((.items | map(select(.id != $it.id)))
+                   + [$it + (if ($it.level // "") == "" and $lv != "" then {level: $lv} else {} end)])'
 }
 
 mf_drop() { mf_write --arg id "$1" '.items |= map(select(.id != $id))'; }
@@ -410,56 +535,60 @@ _spec() { KV_SOURCES+=("$1"); }
 
 sparkle() {
     local account="$1"; shift
-    local plist="" desc=""
+    local plist="" desc="" lv="$KV_LEVEL_DEFAULT"
     while (($#)); do
         case "$1" in
             --plist) plist="$2"; shift 2 ;;
             --desc)  desc="$2";  shift 2 ;;
+            --level) lv="$(conf_level "$2")"; shift 2 ;;
             *) die "keyvault.conf: sparkle: unknown option '$1'" ;;
         esac
     done
-    _spec "$(jq -nc --arg a "$account" --arg p "$plist" --arg d "$desc" \
-        '{type:"sparkle", account:$a, plist:$p, desc:$d}')"
+    _spec "$(jq -nc --arg a "$account" --arg p "$plist" --arg d "$desc" --arg l "$lv" \
+        '{type:"sparkle", account:$a, plist:$p, desc:$d, level:$l}')"
 }
 
 identities() {
     local keychain="${1:-login.keychain-db}"; shift || true
-    local desc=""
+    local desc="" lv="$KV_LEVEL_DEFAULT"
     while (($#)); do
         case "$1" in
-            --desc) desc="$2"; shift 2 ;;
+            --desc)  desc="$2"; shift 2 ;;
+            --level) lv="$(conf_level "$2")"; shift 2 ;;
             *) die "keyvault.conf: identities: unknown option '$1'" ;;
         esac
     done
-    _spec "$(jq -nc --arg k "$keychain" --arg d "$desc" \
-        '{type:"identities", keychain:$k, desc:$d}')"
+    _spec "$(jq -nc --arg k "$keychain" --arg d "$desc" --arg l "$lv" \
+        '{type:"identities", keychain:$k, desc:$d, level:$l}')"
 }
 
 file() {
     local path="$1"; shift
-    local desc="" id=""
+    local desc="" id="" lv="$KV_LEVEL_DEFAULT"
     while (($#)); do
         case "$1" in
-            --desc) desc="$2"; shift 2 ;;
-            --id)   id="$2";   shift 2 ;;
+            --desc)  desc="$2"; shift 2 ;;
+            --id)    id="$2";   shift 2 ;;
+            --level) lv="$(conf_level "$2")"; shift 2 ;;
             *) die "keyvault.conf: file: unknown option '$1'" ;;
         esac
     done
-    _spec "$(jq -nc --arg p "$path" --arg d "$desc" --arg i "$id" \
-        '{type:"file", path:$p, desc:$d, id:$i}')"
+    _spec "$(jq -nc --arg p "$path" --arg d "$desc" --arg i "$id" --arg l "$lv" \
+        '{type:"file", path:$p, desc:$d, id:$i, level:$l}')"
 }
 
 glob() {
     local dir="$1" pattern="$2"; shift 2
-    local desc=""
+    local desc="" lv="$KV_LEVEL_DEFAULT"
     while (($#)); do
         case "$1" in
-            --desc) desc="$2"; shift 2 ;;
+            --desc)  desc="$2"; shift 2 ;;
+            --level) lv="$(conf_level "$2")"; shift 2 ;;
             *) die "keyvault.conf: glob: unknown option '$1'" ;;
         esac
     done
-    _spec "$(jq -nc --arg dir "$dir" --arg pat "$pattern" --arg d "$desc" \
-        '{type:"glob", dir:$dir, pattern:$pat, desc:$d}')"
+    _spec "$(jq -nc --arg dir "$dir" --arg pat "$pattern" --arg d "$desc" --arg l "$lv" \
+        '{type:"glob", dir:$dir, pattern:$pat, desc:$d, level:$l}')"
 }
 
 # meta <id> key=value …  — facts an agent needs to *use* a key without ever seeing it:
@@ -468,6 +597,10 @@ glob() {
 declare -a KV_META=()
 
 dest() { :; }   # read by conf_dest at startup; nothing to do when the config loads for real
+
+conf_level() { level_ok "$1" || die "keyvault.conf: level must be one of: $KV_LEVELS (got '$1')"; printf '%s\n' "$1"; }
+# level <biometric|passphrase|both> — the level for every directive after it, until the next.
+level() { KV_LEVEL_DEFAULT="$(conf_level "$1")"; }
 
 meta() {
     local id="$1"; shift
@@ -483,7 +616,7 @@ meta() {
 # validate can still finish its report on a machine whose config has drifted.
 conf_load() {
     local soft="${1:-}"
-    KV_SOURCES=(); KV_META=()
+    KV_SOURCES=(); KV_META=(); KV_LEVEL_DEFAULT="biometric"
     if [[ ! -f $KV_CONF ]]; then
         [[ $soft == soft ]] && return 1
         die "no config at $KV_CONF"
@@ -643,13 +776,14 @@ collect_identities() {
 # itself doubles every pack, and the catalog is regenerated anyway. Compare canonicalized
 # on both sides — $KV_DEST may sit under a symlinked parent that resolve_path collapsed.
 is_own_output() {   # is_own_output <resolved-path>
-    local path="$1" c_archive c_dest
+    local path="$1" c_archive c_dest c_store
     c_archive="$(cd "$KV_ARCHIVE" 2>/dev/null && pwd -P)"
+    c_store="$(cd "$KV_STORE" 2>/dev/null && pwd -P)"
     c_dest="$(cd "$KV_DEST" 2>/dev/null && pwd -P)"
-    [[ $path == "$(resolve_path "$KV_ARTIFACT")" ]] && return 0
     [[ -n $c_archive && $path == "$c_archive"/* ]] && return 0
+    [[ -n $c_store && $path == "$c_store"/* ]] && return 0
     case "$path" in
-        "$c_dest/README.txt"|"$c_dest/catalog.json"|"$c_dest/catalog.json.new"|"$c_dest/keyvault.age.new") [[ -n $c_dest ]] ;;
+        "$c_dest/README.txt"|"$c_dest/catalog.json"|"$c_dest/catalog.json.new") [[ -n $c_dest ]] ;;
         *) return 1 ;;
     esac
 }
@@ -739,43 +873,29 @@ collect_glob() {
 }
 
 # ---------------------------------------------------------------------------- pack
+#
+# Collect everything keyvault.conf declares onto the RAM disk, then encrypt one file per
+# level. Encrypting needs only public keys, so pack never asks for Touch ID or the
+# passphrase — only macOS's own Keychain prompts while collecting. All or nothing: if any
+# source fails, nothing on disk changes.
 
 cmd_pack() {
-    local fresh=0
     while (($#)); do
         case "$1" in
-            --fresh) fresh=1; shift ;;
-            --identity) KV_IDENTITY="$2"; shift 2 ;;
             *) die "pack: unknown option '$1'" ;;
         esac
     done
-
     have jq || die "jq is not installed — run: brew install jq"
     age_require
+    keys_require
     conf_load
+    ws_open
 
-    local reopened=0
-    if session_active; then
-        reopened=1
-    else
-        session_open "$KV_ARTIFACT" create
-        KV_AUTO_OPENED=1; KV_AUTO_SAVE=0
-        trap auto_finish EXIT
-    fi
-
-    # Everything added by hand survives a repack; conf-declared items are re-collected fresh.
-    if (( fresh )); then
-        mf_write '.items = []'
-        step "Collecting (--fresh: ad-hoc items dropped)"
-    else
-        mf_write '.items |= map(select(.adhoc == true))'
-        local kept; kept="$(jq -r '.items | length' "$(session_manifest)")"
-        step "Collecting$( (( kept )) && printf ' (carrying %s ad-hoc item%s)' "$kept" "$( ((kept>1)) && echo s)" )"
-    fi
-
+    step "Collecting"
     local spec type failed=0
     for spec in "${KV_SOURCES[@]}"; do
         type="$(jq -r '.type' <<<"$spec")"
+        KV_CUR_LEVEL="$(jq -r '.level // "biometric"' <<<"$spec")"
         case "$type" in
             sparkle)    collect_sparkle "$spec"    || failed=1 ;;
             identities) collect_identities "$spec" || failed=1 ;;
@@ -786,6 +906,7 @@ cmd_pack() {
             *) die "keyvault.conf: unknown source type '$type'" ;;
         esac
     done
+    KV_CUR_LEVEL=""
 
     local m mid
     for m in ${KV_META[@]+"${KV_META[@]}"}; do
@@ -793,100 +914,99 @@ cmd_pack() {
         if mf_has "$mid"; then
             mf_write --arg id "$mid" --argjson m "$(jq -c '.meta' <<<"$m")" \
                 '.items |= map(if .id == $id then .meta = ((.meta // {}) + $m) else . end)'
-        else
-            warn "meta $mid  no such item — check the id with 'keyvault catalog'"
+        elif ! added_file "$mid" >/dev/null; then
+            warn "meta $mid  no such item — check the id with 'keyvault list'"
         fi
     done
 
-    # Drop item directories no longer referenced by the manifest.
-    local d keep
-    keep="$(jq -r '.items[].file' "$(session_manifest)" | sed 's#/[^/]*$##' | sort -u)"
-    while IFS= read -r d; do
-        [[ -n $d ]] || continue
-        grep -qxF "items/$(basename "$d")" <<<"$keep" || rm -rf "$d"
-    done < <(find "$(session_dir)/items" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
-
-    mf_write --arg t "$(now_utc)" --arg by "$(whoami)@$(hostname -s)" --arg v "$KV_VERSION" \
-        '.packed_at = $t | .packed_by = $by | .tool_version = $v'
+    # A declared item and a hand-added one may not share an id: restore would not know
+    # which one belongs at the path.
+    local id
+    for id in $(jq -r '.items[].id' "$(session_manifest)"); do
+        added_file "$id" >/dev/null && { bad "$id  is declared in keyvault.conf and was also added by hand — 'keyvault remove $id' or give it an --id"; failed=1; }
+    done
 
     if (( failed )); then
         info ""
-        info "${C_YELLOW}Some sources failed.${C_RESET} The session is still open with what did collect."
-        info "Fix the problem and re-run 'keyvault pack', or seal what you have with 'keyvault close'."
-        trap - EXIT
-        KV_AUTO_OPENED=0
-        return 1
+        die "some sources failed — nothing was written. Fix them and run 'keyvault pack' again."
     fi
 
-    trap - EXIT
-    KV_AUTO_OPENED=0
-    if (( reopened )); then
-        info ""
-        note "session left open (you opened it) — run 'keyvault close' to seal"
-        return 0
-    fi
+    step "Sealing"
+    local l n packed_at; packed_at="$(now_utc)"
+    mkdir -p "$KV_STORE"
+    for l in $KV_LEVELS; do
+        n="$(jq --arg l "$l" '[.items[] | select(.level == $l)] | length' "$(session_manifest)")"
+        rm -f "$KV_STORE/$l.age.new"
+        (( n )) || continue
+        local out="$WS/out/$l"
+        mkdir -p "$out/vault/items"
+        for id in $(jq -r --arg l "$l" '.items[] | select(.level == $l) | .id' "$(session_manifest)"); do
+            cp -Rp "$(item_path "items/$id")" "$out/vault/items/"
+        done
+        jq --arg l "$l" --arg t "$packed_at" --arg by "$(whoami)@$(hostname -s)" --arg v "$KV_VERSION" \
+            '.items |= map(select(.level == $l)) | .level = $l | .packed_at = $t | .packed_by = $by | .tool_version = $v' \
+            "$(session_manifest)" > "$out/vault/manifest.json"
+        tar -czf "$WS/tmp/$l.tgz" -C "$out" vault && rm -rf "$out" \
+            && seal "$l" "$WS/tmp/$l.tgz" "$KV_STORE/$l.age.new" \
+            || { rm -f "$KV_STORE"/*.age.new; die "could not seal the $l level — nothing was written"; }
+        rm -f "$WS/tmp/$l.tgz"
+        ok "$l  $n item$( ((n > 1)) && echo s)"
+    done
 
-    session_close
-    passphrase_reminder
-}
+    # Every level sealed: only now does anything on disk change.
+    store_archive
+    for l in $KV_LEVELS; do
+        if [[ -f $KV_STORE/$l.age.new ]]; then
+            mv -f "$KV_STORE/$l.age.new" "$KV_STORE/$l.age" && chmod 600 "$KV_STORE/$l.age"
+        else
+            rm -f "$KV_STORE/$l.age"     # nothing at this level any more
+        fi
+    done
 
-passphrase_reminder() {
-    [[ -n $KV_IDENTITY ]] && return 0
-    info ""
-    info "${C_BOLD}The passphrase is now the only thing between you and this artifact.${C_RESET}"
-    info "Put it in your password manager ${C_BOLD}and${C_RESET} on paper. There is no recovery path."
-    info "Run 'keyvault card' for a printable recovery sheet."
+    catalog_write_pack "$(session_manifest)" "$packed_at"
+    dest_readme_write
+    say ""
+    ok "$(tildify "$KV_STORE")"
+    note "check it: 'keyvault verify'. Recovery needs only your recovery key: 'keyvault card'."
 }
 
 # ---------------------------------------------------------------------------- list
 
+# From the catalog: listing what is in the vault should not cost a Touch ID.
 cmd_list() {
     have jq || die "jq is not installed"
-    auto_open nosave
-
-    local packed
-    packed="$(jq -r '.packed_at // "never"' "$(session_manifest)")"
-    say "${C_BOLD}$(tildify "$KV_ARTIFACT")${C_RESET}"
-    say "$(dim "packed $packed by $(jq -r '.packed_by // "?"' "$(session_manifest)")")"
+    store_exists || die "no vault at $(tildify "$KV_STORE") — run 'keyvault pack' first"
+    [[ -f $KV_CATALOG ]] || die "the vault has no catalog.json — run 'keyvault pack' to rebuild it"
+    say "${C_BOLD}$(tildify "$KV_STORE")${C_RESET}"
+    say "$(dim "packed $(jq -r '.packed_at // "never"' "$KV_CATALOG")")"
     say ""
-
-    local n; n="$(jq -r '.items | length' "$(session_manifest)")"
-    if [[ $n == 0 ]]; then
-        note "empty"
-        return 0
-    fi
-
-    printf '%-28s %-11s %-5s %s\n' "ID" "TYPE" "ADHOC" "DETAIL"
-    printf '%s\n' "$(dim "$(printf '%.0s─' {1..78})")"
-    local it
-    while IFS= read -r it; do
-        local id type adhoc detail
-        id="$(jq -r '.id' <<<"$it")"
-        type="$(jq -r '.type' <<<"$it")"
-        adhoc="$(jq -r 'if .adhoc then "yes" else "-" end' <<<"$it")"
-        case "$type" in
-            sparkle)    detail="$(jq -r '.public_key' <<<"$it")" ;;
-            identities) detail="$(jq -r '"\(.certs | length) certificates"' <<<"$it")" ;;
-            file)       detail="$(jq -r '.path' <<<"$it")" ;;
-            secret)     detail="$(jq -r '.desc // "(secret)"' <<<"$it")" ;;
-            *)          detail="" ;;
-        esac
-        printf '%-28s %-11s %-5s %s\n' "$id" "$type" "$adhoc" "$detail"
-    done < <(jq -c '.items[]' "$(session_manifest)")
+    printf '%-34s %-11s %-11s %-5s %s\n' "ID" "LEVEL" "TYPE" "ADDED" "DETAIL"
+    printf '%s\n' "$(dim "$(printf '%.0s─' {1..90})")"
+    jq -r '.items[] | [.id, (.level // "?"), .type, (if .adhoc then "yes" else "-" end),
+            (if .type == "sparkle" then .public_key
+             elif .type == "identities" then "\(.certs | length) certificates"
+             elif .path then .path else (.desc // "") end)] | @tsv' "$KV_CATALOG" \
+        | while IFS=$'\t' read -r id l t a d; do
+            printf '%-34s %-11s %-11s %-5s %s\n' "$id" "$l" "$t" "$a" "$d"
+          done
 }
 
 # ---------------------------------------------------------------------------- add / remove
+#
+# A hand-added item is its own file, added/<id>.<level>.age. Adding one encrypts, and
+# removing one deletes (after archiving), so neither ever needs Touch ID or the passphrase.
 
 cmd_add() {
-    (($#)) || die "usage: keyvault add <id> --file PATH | --secret | --stdin  [--desc TEXT] [--restore-to PATH]"
+    (($#)) || die "usage: keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc TEXT] [--meta k=v] [--restore-to PATH]"
     local id="$1"; shift
-    local src="" mode="" desc="" restore_to="" extra='{}'
+    local src="" mode="" desc="" restore_to="" extra='{}' lv=""
     while (($#)); do
         case "$1" in
             --file)       mode=file;   src="$2"; shift 2 ;;
             --secret)     mode=secret; shift ;;
             --stdin)      mode=stdin;  shift ;;
             --desc)       desc="$2";       shift 2 ;;
+            --level)      lv="$2";         shift 2 ;;
             --restore-to) restore_to="$2"; shift 2 ;;
             --meta)       [[ $2 == *=* ]] || die "add: --meta wants key=value"
                           extra="$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '. + {($k): $v}' <<<"$extra")"
@@ -895,82 +1015,102 @@ cmd_add() {
         esac
     done
     [[ -n $mode ]] || die "add: one of --file PATH, --secret or --stdin is required"
-    [[ $id =~ ^[A-Za-z0-9._-]+$ ]] || die "add: id must be [A-Za-z0-9._-]"
-
+    [[ $id =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]] || die "add: id must be [A-Za-z0-9._-]"
+    [[ -n $lv ]] || lv="biometric"      # predictable: never depends on where 'level' sits in the config
+    level_ok "$lv" || die "add: --level must be one of: $KV_LEVELS"
     have jq || die "jq is not installed"
-    auto_open save
+    age_require
+    keys_require
+    if jq -e --arg id "$id" 'any(.items[]?; .id == $id and (.adhoc | not))' "$KV_CATALOG" >/dev/null 2>&1; then
+        die "add: '$id' is declared in keyvault.conf — choose another id"
+    fi
 
+    ws_open
+    KV_CUR_LEVEL="$lv"
+    local dir; dir="$(item_path "items/$id")"; mkdir -p "$dir"
     case "$mode" in
         file)
             src="$(untildify "$src")"
             [[ -f $src ]] || die "add: no such file: $src"
             [[ -n $restore_to ]] || restore_to="$src"
-            local new; new="$(item_path "items/.$id.new")"; rm -rf "$new"; mkdir -p "$new"
-            cp -p "$src" "$new/$(basename "$src")" || { rm -rf "$new"; die "add: copy failed"; }
-            chmod 600 "$new/$(basename "$src")"
-            item_swap "$id" "$new"
+            cp -p "$src" "$dir/$(basename "$src")" || die "add: copy failed"
+            chmod 600 "$dir/$(basename "$src")"
             mf_put "$(jq -nc \
                 --arg id "$id" --arg path "$(tildify "$restore_to")" --arg mode "$(file_mode "$src")" \
                 --arg file "items/$id/$(basename "$src")" --arg sha "$(sha256_of "$src")" \
                 --arg desc "$desc" --argjson fm "$(file_meta "$src")" --argjson x "$extra" \
                 '{id:$id, type:"file", kind:$fm.kind, path:$path, mode:$mode, file:$file,
                   sha256:$sha, desc:$desc, meta:($fm.meta + $x), adhoc:true}')"
-            ok "$id  <- $(tildify "$src")"
             ;;
         secret|stdin)
-            # Built beside the old item and swapped in only once it is complete: a
-            # replacement that fails halfway must leave the old one exactly as it was.
-            local new out; new="$(item_path "items/.$id.new")"; rm -rf "$new"; mkdir -p "$new"
-            out="$new/secret"
+            local out="$dir/secret"
             if [[ $mode == secret ]]; then
                 local v1 v2
-                printf 'Secret for %s (not echoed): ' "$id" >&2; IFS= read -rs v1 </dev/tty; printf '\n' >&2
-                printf 'Again: ' >&2;                            IFS= read -rs v2 </dev/tty; printf '\n' >&2
-                [[ $v1 == "$v2" ]] || { rm -rf "$new"; die "add: the two entries differ"; }
-                [[ -n $v1 ]] || { rm -rf "$new"; die "add: empty secret"; }
-                printf '%s' "$v1" > "$out"
+                { exec 4</dev/tty; } 2>/dev/null || die "add --secret needs a terminal; pipe it in with --stdin"
+                printf 'Secret for %s (not echoed): ' "$id" >/dev/tty; IFS= read -rs v1 <&4; printf '\n' >/dev/tty
+                printf 'Again: ' >/dev/tty;                            IFS= read -rs v2 <&4; printf '\n' >/dev/tty
+                exec 4<&-
+                [[ $v1 == "$v2" ]] || die "add: the two entries differ"
+                [[ -n $v1 ]] || die "add: empty secret"
+                ( umask 077; printf '%s' "$v1" > "$out" )
             else
-                cat > "$out"
-                [[ -s $out ]] || { rm -rf "$new"; die "add: nothing arrived on stdin"; }
+                ( umask 077; cat > "$out" )
+                [[ -s $out ]] || die "add: nothing arrived on stdin"
             fi
-            chmod 600 "$out"
-            item_swap "$id" "$new"; out="$(item_path "items/$id/secret")"
             mf_put "$(jq -nc \
                 --arg id "$id" --arg file "items/$id/secret" --arg sha "$(sha256_of "$out")" \
                 --arg desc "$desc" --arg to "$(tildify "${restore_to:-}")" --argjson x "$extra" \
                 '{id:$id, type:"secret", kind:"secret", meta:$x, file:$file, sha256:$sha, desc:$desc,
                   path:(if $to == "" then null else $to end), adhoc:true}')"
-            ok "$id  stored ($(wc -c <"$out" | tr -d ' ') bytes)"
             ;;
     esac
+    KV_CUR_LEVEL=""
+
+    mf_write --arg t "$(now_utc)" '.added_at = $t'
+    tar -czf "$WS/tmp/add.tgz" -C "$(dirname "$(session_dir)")" vault \
+        && mkdir -p "$KV_ADDED" \
+        && seal "$lv" "$WS/tmp/add.tgz" "$KV_ADDED/$id.$lv.age.new" \
+        || { rm -f "$KV_ADDED/$id.$lv.age.new"; die "add: could not seal $id — nothing was written"; }
+    store_archive
+    local old; old="$(added_file "$id")" && [[ $old != "$KV_ADDED/$id.$lv.age" ]] && rm -f "$old"
+    mv -f "$KV_ADDED/$id.$lv.age.new" "$KV_ADDED/$id.$lv.age" && chmod 600 "$KV_ADDED/$id.$lv.age"
+    catalog_upsert "$(session_manifest)"
+    ok "$id  sealed at level $lv"
 }
 
 cmd_remove() {
     (($#)) || die "usage: keyvault remove <id>"
-    local id="$1"
+    local id="$1" f
     have jq || die "jq is not installed"
-    auto_open save
-    mf_has "$id" || die "remove: no item with id '$id' (keyvault list)"
-    rm -rf "$(item_path "items/$id")"
-    mf_drop "$id"
-    ok "$id  removed"
+    if ! f="$(added_file "$id")"; then
+        jq -e --arg id "$id" 'any(.items[]?; .id == $id)' "$KV_CATALOG" >/dev/null 2>&1 \
+            && die "remove: '$id' comes from keyvault.conf — take it out there and run 'keyvault pack'"
+        die "remove: no item with id '$id' (keyvault list)"
+    fi
+    store_archive
+    rm -f "$f"
+    catalog_drop "$id"
+    ok "$id  removed (a copy stays in $(tildify "$KV_ARCHIVE") for $KV_ARCHIVE_KEEP more changes)"
 }
 
 # ---------------------------------------------------------------------------- show
 
 cmd_show() {
-    (($#)) || die "usage: keyvault show <id> [--out PATH | --stdout]"
+    (($#)) || die "usage: keyvault show <id> [--out PATH | --stdout] [--recovery]"
     local id="$1"; shift
     local out="" to_stdout=0
     while (($#)); do
         case "$1" in
-            --out)    out="$2"; shift 2 ;;
-            --stdout) to_stdout=1; shift ;;
+            --out)      out="$2"; shift 2 ;;
+            --stdout)   to_stdout=1; shift ;;
+            --recovery) KV_RECOVERY=1; shift ;;
+            --via)      KV_VIA="$2"; shift 2 ;;
             *) die "show: unknown option '$1'" ;;
         esac
     done
+    (( to_stdout )) || [[ -n $out ]] || die "show: pass --out PATH (safe) or --stdout (goes into your scrollback)"
     have jq || die "jq is not installed"
-    auto_open nosave
+    vault_load "$id"
     local it; it="$(mf_item "$id")"
     [[ -n $it ]] || die "show: no item with id '$id'"
     local src; src="$(session_dir)/$(jq -r '.file' <<<"$it")"
@@ -978,14 +1118,24 @@ cmd_show() {
     if (( to_stdout )); then
         [[ -t 1 ]] && info "${C_YELLOW}!${C_RESET} writing a secret to your terminal scrollback."
         cat "$src"
-    elif [[ -n $out ]]; then
+    else
         out="$(untildify "$out")"
         [[ -e $out ]] && die "show: $out already exists"
         ( umask 077 && cp "$src" "$out" ) || die "show: could not write $out"
         ok "$id -> $(tildify "$out")"
-    else
-        die "show: pass --out PATH (safe) or --stdout (goes into your scrollback)"
     fi
+}
+
+# ---------------------------------------------------------------------------- opening options
+
+# --recovery opens with the paper key instead of this machine's factors (the only way on
+# a new Mac); --via picks the device that unlocks the biometric factor.
+open_opt() {   # open_opt "$1" "$2" -> how many args it consumed (0 if not an open option)
+    case "$1" in
+        --recovery) KV_RECOVERY=1; return 1 ;;
+        --via)      [[ -n ${2:-} ]] || die "--via needs a device name"; KV_VIA="$2"; return 2 ;;
+    esac
+    return 0
 }
 
 # ---------------------------------------------------------------------------- verify
@@ -995,9 +1145,11 @@ cmd_show() {
 # actually good", which is the only question that matters before you need it.
 
 cmd_verify() {
+    local n
+    while (($#)); do open_opt "$@"; n=$?; (( n )) || die "verify: unknown option '$1'"; shift "$n"; done
     have jq || die "jq is not installed"
-    auto_open nosave
-    step "Verifying $(tildify "$(session_get source)" 2>/dev/null || echo "$KV_ARTIFACT")"
+    vault_load
+    step "Verifying $(tildify "$KV_STORE")$( ((KV_RECOVERY)) && echo ' with the recovery key')"
 
     local rc=0 it
     while IFS= read -r it; do
@@ -1063,8 +1215,10 @@ cmd_verify() {
 # a key that no longer signs what it is supposed to sign.
 
 cmd_validate() {
+    local n
+    while (($#)); do open_opt "$@"; n=$?; (( n )) || die "validate: unknown option '$1'"; shift "$n"; done
     have jq || die "jq is not installed"
-    auto_open nosave
+    vault_load
     step "Validating against this machine"
 
     local rc=0 stale=0 it
@@ -1216,18 +1370,11 @@ cmd_restore() {
             --dry-run) apply=0; shift ;;
             --only)    only="$2"; shift 2 ;;
             --force)   force=1; shift ;;
-            --vault)   KV_RESTORE_SRC="$2"; shift 2 ;;
-            --identity) KV_IDENTITY="$2"; shift 2 ;;
-            *) die "restore: unknown option '$1'" ;;
+            *)         local n; open_opt "$@"; n=$?; (( n )) || die "restore: unknown option '$1'"; shift "$n" ;;
         esac
     done
     have jq || die "jq is not installed"
-
-    if ! session_active; then
-        session_open "${KV_RESTORE_SRC:-$KV_ARTIFACT}"
-        KV_AUTO_OPENED=1; KV_AUTO_SAVE=0
-        trap auto_finish EXIT
-    fi
+    if [[ -n $only ]]; then vault_load "$only"; else vault_load; fi
 
     if (( apply )); then
         step "Restoring — this WILL write to disk and to your login keychain"
@@ -1345,65 +1492,79 @@ cmd_restore() {
 
 # ---------------------------------------------------------------------------- card
 
+# From the catalog and the public keys: printing the recovery sheet opens nothing.
 cmd_card() {
     have jq || die "jq is not installed"
-    auto_open nosave
-    local m; m="$(session_manifest)"
-
+    local cat="$KV_CATALOG"
+    [[ -f $cat ]] || cat=/dev/null
     cat <<EOF
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  KEYVAULT RECOVERY SHEET                                                     │
-│  Print this. Keep it with the passphrase, somewhere the house key is not.     │
+│  Print this. Write the recovery key on it. Keep it where this Mac is not.   │
 └──────────────────────────────────────────────────────────────────────────────┘
 
-  Artifact   $(tildify "$KV_ARTIFACT")
-  Packed     $(jq -r '.packed_at // "never"' "$m")  by $(jq -r '.packed_by // "?"' "$m")
-  Format     age (armored) -> tar.gz -> vault/{manifest.json, items/…}
+  Vault      $(tildify "$KV_STORE")/
+  Packed     $(jq -r '.packed_at // "never"' "$cat" 2>/dev/null || echo never)
 
-  TO OPEN IT WITH NO TOOLS BUT age:
+  RECOVERY KEY (write it here, by hand — it is stored nowhere else)
 
-      age --decrypt keyvault.age | tar -xzv
-      cat vault/manifest.json
+      AGE-SECRET-KEY-1 ______________________________________________________
+
+      Its public half, to check you copied it right:
+      $(recipient_of recovery)
+
+  TO OPEN THE VAULT WITH NOTHING BUT age (brew install age):
+
+      printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt          # the key above
+      cd keyvault/
+      for f in *.age added/*.age; do
+          cp "\$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+          tar -xzf x; mv vault "vault-\$(basename "\$f" .age)"
+      done
+      rm x ../r.txt                                        # each vault-*/manifest.json lists what is where
+
+  Or with keyvault installed:   keyvault restore --recovery
 
   WHAT IS INSIDE
 
-$(jq -r '.items[] | "      \(.id)\n          \(.desc // "—")"' "$m")
+$(jq -r '.items[]? | "      \(.id)  [\(.level // "?")]\n          \(.desc // "—")"' "$cat" 2>/dev/null)
 
-  PUBLIC KEYS (not secret — use these to check a restored key is the right one)
+  PUBLIC KEYS (not secret — check a restored key is the right one)
 
-$(jq -r '.items[] | select(.type=="sparkle") | "      \(.account)\n          \(.public_key)"' "$m")
+$(jq -r '.items[]? | select(.type=="sparkle") | "      \(.account)\n          \(.public_key)"' "$cat" 2>/dev/null)
 
-  IF YOU HAVE LOST THE PASSPHRASE
-      Nothing here is recoverable. Re-issue what can be re-issued (Apple certificates
-      via developer.apple.com, App Store Connect keys via appstoreconnect.apple.com).
-      A lost Sparkle key cannot be re-issued: every installed copy of that app must be
-      replaced by hand. Mint a new key, ship it in a new build, and tell users.
+  IF THE RECOVERY KEY IS LOST TOO
+      Nothing here is recoverable without this Mac. Re-issue what can be re-issued
+      (Apple certificates, App Store Connect keys). A lost Sparkle key cannot be:
+      every installed copy of that app must be replaced by hand.
 EOF
 }
 
 # ---------------------------------------------------------------------------- status / doctor
 
 cmd_status() {
-    if session_active; then
-        local opened age_min
-        opened="$(session_get opened_at)"
-        say "${C_YELLOW}session OPEN${C_RESET}"
-        say "  mount    $(session_get mount)$([[ $(session_get fallback) == true ]] && echo "  ${C_YELLOW}(on disk, not a RAM disk)${C_RESET}")"
-        say "  from     $(tildify "$(session_get source)")"
-        say "  since    $opened"
-        say ""
-        say "  Plaintext keys are readable right now. Run 'keyvault close' to seal,"
-        say "  or 'keyvault abort' to discard changes."
+    say "${C_BOLD}keys${C_RESET}  $(tildify "$KV_KEYS")"
+    if keys_ready; then
+        local d
+        for d in "$KV_KEYS"/biometric.*.age; do
+            [[ -f $d ]] && ok "biometric  $(basename "$d" .age | sed 's/^biometric\.//')"
+        done
+        [[ -f $KV_KEYS/passphrase.key.age ]] && ok "passphrase"
+        ok "recovery   $(recipient_of recovery)  (the key itself is on paper)"
     else
-        say "${C_GREEN}sealed${C_RESET} — no plaintext is mounted"
+        warn "none yet — run 'keyvault setup'"
     fi
     say ""
-    if [[ -f $KV_ARTIFACT ]]; then
-        say "  artifact $(tildify "$KV_ARTIFACT")  ($(du -h "$KV_ARTIFACT" | awk '{print $1}'), modified $(date -r "$KV_ARTIFACT" '+%Y-%m-%d %H:%M'))"
-        local n; n="$(ls "$KV_ARCHIVE"/keyvault-*.age 2>/dev/null | wc -l | tr -d ' ')"
-        [[ $n -gt 0 ]] && say "  archive  $n previous version$([[ $n -gt 1 ]] && echo s) in $(tildify "$KV_ARCHIVE")"
+    say "${C_BOLD}vault${C_RESET}  $(tildify "$KV_STORE")"
+    if store_exists; then
+        local l f a
+        while IFS=$'\t' read -r l f a; do
+            printf '  %-40s %-11s %s\n' "${f#"$KV_STORE"/}" "$l" "$(date -r "$f" '+%Y-%m-%d %H:%M')"
+        done < <(store_files)
+        local n; n="$(ls -1d "$KV_ARCHIVE"/[0-9]*/ 2>/dev/null | wc -l | tr -d ' ')"
+        (( n > 0 )) && note "$n earlier version$( ((n > 1)) && echo s) in $(tildify "$KV_ARCHIVE")"
     else
-        say "  artifact ${C_YELLOW}none yet${C_RESET} — run 'keyvault pack'"
+        warn "nothing packed yet — run 'keyvault pack'"
     fi
     return 0
 }
@@ -1423,6 +1584,16 @@ cmd_doctor() {
     if [[ -n $sb ]]; then ok "Sparkle tools  $(tildify "$sb")"
     else warn "Sparkle tools not found — build a Sparkle app once, or set KEYVAULT_SPARKLE_BIN"; fi
 
+    if have age-plugin-se; then ok "age-plugin-se  (Touch ID)"
+    else warn "age-plugin-se missing — Touch ID needs it: brew install age-plugin-se"; fi
+
+    step "Keys"
+    if keys_ready; then
+        ok "biometric, passphrase and recovery keys in $(tildify "$KV_KEYS")"
+    else
+        warn "no keys yet — run 'keyvault setup'"
+    fi
+
     step "Configuration"
     [[ -f $KV_CONF ]] && ok "config  $(tildify "$KV_CONF")" || bad "config  $(tildify "$KV_CONF") is missing"
     [[ -d $KV_DEST ]] && ok "destination  $(tildify "$KV_DEST")" \
@@ -1433,11 +1604,12 @@ cmd_doctor() {
     local spec
     for spec in "${KV_SOURCES[@]}"; do
         local type; type="$(jq -r '.type' <<<"$spec")"
+        local lv; lv="$(jq -r '.level' <<<"$spec")"
         case "$type" in
             sparkle)
                 local a p; a="$(jq -r '.account' <<<"$spec")"; p="$(untildify "$(jq -r '.plist' <<<"$spec")")"
                 if [[ -n $sb ]] && [[ -n "$("$sb/generate_keys" -p --account "$a" 2>/dev/null)" ]]; then
-                    ok "sparkle $a"
+                    ok "sparkle $a  $(dim "[$lv]")"
                 else
                     bad "sparkle $a  no such key in the login keychain"
                 fi
@@ -1446,14 +1618,14 @@ cmd_doctor() {
             identities)
                 local k n; k="$(jq -r '.keychain' <<<"$spec")"
                 n="$(security find-identity -v "$k" 2>/dev/null | grep -c '^[[:space:]]*[0-9]*)')"
-                [[ $n -gt 0 ]] && ok "identities $k  $n found" || bad "identities $k  none found"
+                [[ $n -gt 0 ]] && ok "identities $k  $n found  $(dim "[$lv]")" || bad "identities $k  none found"
                 ;;
             file)
                 local f r; f="$(untildify "$(jq -r '.path' <<<"$spec")")"
                 r="$(resolve_path "$f")"
                 if [[ -f $r ]]; then
-                    [[ $r == "$f" ]] && ok "file $(tildify "$f")" \
-                                     || ok "file $(tildify "$f")  $(dim "-> $(tildify "$r")")"
+                    [[ $r == "$f" ]] && ok "file $(tildify "$f")  $(dim "[$lv]")" \
+                                     || ok "file $(tildify "$f")  $(dim "-> $(tildify "$r") [$lv]")"
                 else
                     bad "file $(tildify "$f")  missing"
                 fi
@@ -1462,7 +1634,7 @@ cmd_doctor() {
                 local d pat n
                 d="$(untildify "$(jq -r '.dir' <<<"$spec")")"; pat="$(jq -r '.pattern' <<<"$spec")"
                 n="$(find -L "$d" -maxdepth 1 -type f -name "$pat" 2>/dev/null | wc -l | tr -d ' ')"
-                [[ ${n:-0} -gt 0 ]] && ok "glob $(tildify "$d")/$pat  $n match$([[ $n -gt 1 ]] && echo es)" \
+                [[ ${n:-0} -gt 0 ]] && ok "glob $(tildify "$d")/$pat  $n match$([[ $n -gt 1 ]] && echo es)  $(dim "[$lv]")" \
                                     || warn "glob $(tildify "$d")/$pat  no matches"
                 ;;
         esac
@@ -1472,53 +1644,208 @@ cmd_doctor() {
 
 # ---------------------------------------------------------------------------- catalog
 #
-# catalog.json sits next to the artifact, unencrypted, so an agent can learn what exists
+# catalog.json sits next to the vault, unencrypted, so an agent can learn what exists
 # — ids, kinds, key ids, public keys, expiry — and ask for exactly the right thing.
 # It is built from an allowlist: a field the catalog does not name never leaves the vault.
 # Not even sha256 goes out; for a short typed secret a hash is as good as the value.
 
-catalog_write() {   # catalog_write <manifest>
-    jq --arg t "$(now_utc)" --arg a "$(tildify "$KV_ARTIFACT")" '
-        {catalog_version: 1, generated_at: $t, packed_at, artifact: $a,
-         items: [ .items[] | {
-             id, type, kind: (.kind // .type), desc, path, link, account, public_key, plist,
+catalog_public() {   # catalog_public <manifest> -> the allowlisted items, as a JSON array
+    jq -c '[ .items[] | {
+             id, type, kind: (.kind // .type), level, desc, path, link, account, public_key, plist,
              certs: (if .certs then [.certs[] | {name, kind, team_id, sha1, not_after}] else null end),
              meta: (.meta // {}), adhoc
-         } | with_entries(select(.value != null and .value != "")) ] }' "$1" > "$KV_CATALOG.new" \
+         } | with_entries(select(.value != null and .value != "")) ]' "$1"
+}
+
+catalog_items() { jq -c '.items // []' "$KV_CATALOG" 2>/dev/null || echo '[]'; }
+
+catalog_save() {   # catalog_save <items-json> [packed_at]
+    local packed="${2:-}"
+    [[ -n $packed ]] || packed="$(jq -r '.packed_at // ""' "$KV_CATALOG" 2>/dev/null)"
+    mkdir -p "$KV_DEST"
+    jq -n --argjson items "$1" --arg t "$(now_utc)" --arg p "$packed" --arg s "$(tildify "$KV_STORE")" \
+        --arg rb "$(recipient_of biometric)" --arg rp "$(recipient_of passphrase)" --arg rr "$(recipient_of recovery)" \
+        '{catalog_version: 2, generated_at: $t, packed_at: (if $p == "" then null else $p end), store: $s,
+          recipients: {biometric: $rb, passphrase: $rp, recovery: $rr},
+          items: ($items | sort_by(.id))}' > "$KV_CATALOG.new" \
         && mv -f "$KV_CATALOG.new" "$KV_CATALOG" \
         || warn "could not write $(tildify "$KV_CATALOG")"
 }
+
+# pack: declared items are replaced wholesale; hand-added ones are kept. An added file the
+# catalog has lost track of still gets a minimal entry, so list never hides it.
+catalog_write_pack() {   # catalog_write_pack <manifest> <packed_at>
+    local declared kept f b known
+    declared="$(catalog_public "$1")"
+    kept="$(catalog_items | jq -c '[.[] | select(.adhoc)]')"
+    for f in "$KV_ADDED"/*.age; do
+        [[ -f $f ]] || continue
+        b="$(basename "$f" .age)"
+        known="$(jq --arg id "${b%.*}" 'any(.[]; .id == $id)' <<<"$kept")"
+        [[ $known == true ]] || kept="$(jq -c --arg id "${b%.*}" --arg l "${b##*.}" \
+            '. + [{id:$id, level:$l, adhoc:true, desc:"(added by hand; details are inside the vault)"}]' <<<"$kept")"
+    done
+    catalog_save "$(jq -nc --argjson a "$declared" --argjson b "$kept" '$a + $b')" "$2"
+}
+
+catalog_upsert() {   # catalog_upsert <manifest> — replace entries with the same ids
+    local new; new="$(catalog_public "$1")"
+    catalog_save "$(catalog_items | jq -c --argjson n "$new" '[.[] | select(.id as $i | ($n | map(.id) | index($i)) | not)] + $n')"
+}
+
+catalog_drop() { catalog_save "$(catalog_items | jq -c --arg id "$1" 'map(select(.id != $id))')"; }
 
 # ---------------------------------------------------------------------------- destination README
 
 dest_readme_write() {
     local f="$KV_DEST/README.txt"
     cat > "$f" <<EOF
-This folder holds an encrypted backup of signing keys that cannot be re-issued.
+This folder holds an encrypted backup of keys that cannot be re-issued.
 
-    keyvault.age      the backup. Encrypted with age. Safe to sync, copy, email to
-                      yourself — it is useless without the passphrase.
-    archive/          the previous $KV_ARCHIVE_KEEP versions, same encryption.
+    keyvault/*.age          the vault, one file per level (biometric, passphrase, both)
+    keyvault/added/*.age    items added by hand, one file each
+    catalog.json            what is inside — public facts only, no secrets
+    archive/                the previous $KV_ARCHIVE_KEEP versions
 
-TO OPEN IT, on any machine:
+Every file is encrypted with age, in one or two layers. Each layer opens with this Mac's
+Touch ID or passphrase key — or with the RECOVERY KEY, which is written on paper and
+stored nowhere on any computer. It is safe to sync, copy and email: it is useless
+without one of those.
+
+TO OPEN IT on any machine, with the recovery key:
 
     brew install age
-    age --decrypt keyvault.age | tar -xzv
-    cat vault/manifest.json
+    printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt
+    cd keyvault
+    for f in *.age added/*.age; do
+        cp "\$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+        tar -xzf x; mv vault "vault-\$(basename "\$f" .age)"
+    done
+    rm x ../r.txt
 
-manifest.json says what every file under vault/items/ is and where it belongs.
+Each vault-*/manifest.json says what every file in its items/ is and where it belongs.
 
-The tool that made this is keyvault (https://github.com/everlof/keyvault). It is one
-bash script; you do not need it to recover — the two commands above are enough — but it
-automates putting everything back:
+The tool that made this is keyvault (https://github.com/everlof/keyvault). You do not
+need it to recover — the commands above are enough — but it puts everything back:
 
-    keyvault restore              # shows what it would do
-    keyvault restore --apply      # actually does it
-
-THE PASSPHRASE IS NOT STORED ANYWHERE. If it is lost, so is everything here.
+    keyvault restore --recovery            # shows what it would do
+    keyvault restore --recovery --apply    # does it
 
 Last written $(now_utc) by $(whoami)@$(hostname -s).
 EOF
+}
+
+# ---------------------------------------------------------------------------- setup
+#
+# Creates the three keys. Every secret lives in a shell variable or a pipe until it is
+# wrapped; only wrapped keys and public keys reach the disk. The recovery key is shown
+# once, to be written down, and never stored.
+
+cmd_setup() {
+    local ac="any-biometry-or-passcode" force=0
+    while (($#)); do
+        case "$1" in
+            --access-control) ac="$2"; shift 2 ;;
+            --force)          force=1; shift ;;
+            *) die "setup: unknown option '$1'" ;;
+        esac
+    done
+    { exec 3</dev/tty; } 2>/dev/null || die "setup needs a human at a terminal"
+    age_require
+    if keys_ready && (( ! force )); then
+        die "keys already exist in $(tildify "$KV_KEYS") — 'keyvault status' shows them"
+    fi
+    if store_exists && (( force )); then
+        die "a vault already exists: new keys could not open it. Restore it, move $(tildify "$KV_STORE") aside, then run setup --force"
+    fi
+    if [[ -z ${KEYVAULT_SE_IDENTITY:-} ]]; then
+        have age-plugin-se || die "Touch ID needs age-plugin-se — run: brew install age-plugin-se"
+    fi
+
+    local tmp="$KV_KEYS.new"
+    rm -rf "$tmp"; mkdir -p "$tmp"; chmod 700 "$tmp"
+
+    # 1. biometric: an age key, wrapped by a key that lives in the Secure Enclave.
+    step "1/3  biometric key (Touch ID)"
+    local se_recipient
+    if [[ -n ${KEYVAULT_SE_IDENTITY:-} ]]; then          # tests: a plain key stands in for the enclave
+        se_recipient="$(age-keygen -y "$KEYVAULT_SE_IDENTITY")"
+    else
+        age-plugin-se keygen --access-control "$ac" -o "$tmp/biometric.mac.identity" >/dev/null 2>&1 \
+            || { rm -rf "$tmp"; die "could not create a Secure Enclave key (does this Mac have Touch ID?)"; }
+        se_recipient="$(age-plugin-se recipients -i "$tmp/biometric.mac.identity" 2>/dev/null)"
+    fi
+    [[ -n $se_recipient ]] || { rm -rf "$tmp"; die "could not read the Secure Enclave key's recipient"; }
+    local kb pb
+    kb="$(age-keygen 2>/dev/null)"; pb="$(printf '%s\n' "$kb" | age-keygen -y -)"
+    printf '%s\n' "$kb" | age --armor -r "$se_recipient" -o "$tmp/biometric.mac.age" \
+        || { rm -rf "$tmp"; die "could not wrap the biometric key"; }
+    kb=""
+    ok "wrapped by this Mac's Secure Enclave ($ac)"
+
+    # 2. passphrase: an age key, wrapped with your passphrase.
+    step "2/3  passphrase key"
+    local kp pp
+    kp="$(age-keygen 2>/dev/null)"; pp="$(printf '%s\n' "$kp" | age-keygen -y -)"
+    if [[ -n ${KEYVAULT_PASSPHRASE_IDENTITY:-} ]]; then  # tests: a plain key stands in for scrypt
+        printf '%s\n' "$kp" | age --armor -r "$(age-keygen -y "$KEYVAULT_PASSPHRASE_IDENTITY")" -o "$tmp/passphrase.key.age"
+    else
+        info "  Choose the passphrase. Leave it empty and age suggests a strong one."
+        printf '%s\n' "$kp" | age --armor --passphrase -o "$tmp/passphrase.key.age"
+    fi || { rm -rf "$tmp"; die "could not wrap the passphrase key"; }
+    kp=""
+    ok "wrapped with your passphrase"
+
+    # 3. recovery: shown once, stored nowhere.
+    step "3/3  recovery key"
+    local kr pr secret
+    if [[ -n ${KEYVAULT_RECOVERY_IDENTITY:-} ]]; then      # tests: a known key
+        kr="$(cat "$KEYVAULT_RECOVERY_IDENTITY")"
+    else
+        kr="$(age-keygen 2>/dev/null)"
+    fi
+    pr="$(printf '%s\n' "$kr" | age-keygen -y -)"
+    secret="$(printf '%s\n' "$kr" | grep '^AGE-SECRET-KEY-')"
+    kr=""
+    cat >/dev/tty <<EOF
+
+  ${C_BOLD}Write this down.${C_RESET} It opens the vault on any machine, without Touch ID or the
+  passphrase — which is exactly why it must not live on a computer. Paper, in two places,
+  or your password manager's most protected corner.
+
+      ${C_BOLD}$(printf '%s' "$secret" | sed 's/.\{16\}/& /g')${C_RESET}
+
+EOF
+    local tail="${secret: -6}" answer
+    while :; do
+        printf '  Type its last 6 characters to confirm you have it: ' >/dev/tty
+        IFS= read -r answer <&3 || { rm -rf "$tmp"; die "setup cancelled"; }
+        answer="$(printf '%s' "$answer" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
+        [[ $answer == "$tail" ]] && break
+        printf '  That does not match. Look again.\n' >/dev/tty
+    done
+    secret=""
+    printf '\033[2J\033[H' >/dev/tty 2>/dev/null     # clear the screen: it is on paper now
+    ok "recovery key confirmed — it is not stored anywhere"
+
+    printf 'biometric %s\npassphrase %s\nrecovery %s\n' "$pb" "$pp" "$pr" > "$tmp/recipients"
+    chmod 600 "$tmp"/*
+    if [[ -d $KV_KEYS ]]; then
+        mv "$KV_KEYS" "$KV_KEYS.old.$(stamp)" || die "could not move the old keys aside"
+    fi
+    mv "$tmp" "$KV_KEYS" || die "could not install the keys"
+    ok "keys in $(tildify "$KV_KEYS")"
+    say ""
+    say "Next: 'keyvault pack'. Print 'keyvault card' and keep it with the recovery key."
+}
+
+cmd_recovery_check() {
+    have age-keygen || die "age is not installed"
+    keys_require
+    KV_RECOVERY=1
+    ws_open
+    factor_unlock recovery      # compares against the recorded public key, and dies if it differs
+    ok "that is the right recovery key"
 }
 
 # ---------------------------------------------------------------------------- init
@@ -1529,37 +1856,42 @@ cmd_init() {
     cp "$KV_ROOT/keyvault.conf.example" "$KV_CONF" || die "could not write $(tildify "$KV_CONF")"
     chmod 600 "$KV_CONF"
     ok "$(tildify "$KV_CONF")"
-    say "Edit it ('keyvault edit'), check it ('keyvault doctor'), then 'keyvault pack'."
+    say "Edit it ('keyvault edit'), create the keys ('keyvault setup'), check ('keyvault doctor'), then 'keyvault pack'."
 }
 
 # ---------------------------------------------------------------------------- help
 
 cmd_help() {
     cat <<EOF
-${C_BOLD}keyvault${C_RESET} $KV_VERSION — one encrypted artifact holding every key you cannot re-issue
+${C_BOLD}keyvault${C_RESET} $KV_VERSION — an encrypted backup of every key you cannot re-issue
 
-${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}
+${C_BOLD}SETTING UP${C_RESET}
   init                        create your config from keyvault.conf.example
-  pack [--fresh]              collect everything keyvault.conf declares and seal it
-  list                        what is in the vault (names only, no secrets)
-  validate                    does the vault still match this machine?  (exit 2: out of date)
-  verify                      is the vault internally sound? (offline, no keychain)
+  setup                       create the keys: biometric (Touch ID), passphrase, recovery (paper)
+  doctor                      check tools, keys, config and every declared source
+
+${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passphrase · both
+  pack                        collect what keyvault.conf declares and seal it (asks for nothing)
+  list                        what is in the vault, from the catalog (asks for nothing)
+  verify                      is the vault internally sound?
+  validate                    does it still match this machine?  (exit 2: out of date)
   card                        a printable recovery sheet
+  recovery-check              is the key on your paper the right one?
 
 ${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
-  add <id> --file PATH        add a file (an .p8, a licence, anything)
-  add <id> --secret           add a secret typed at the prompt
-  add <id> --stdin            add a secret piped in
-      …  [--desc TEXT] [--restore-to PATH]
-  remove <id>                 take one thing out
+  add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
+                              recovery codes, a licence, an .p8 — anything (asks for nothing)
+  remove <id>                 take an added item out
   show <id> --out PATH        write one item back out
 
 ${C_BOLD}PUTTING IT BACK${C_RESET}
-  restore [--only ID] [--force]     dry run: says what it would do
-  restore --apply                   do it
+  restore [--only ID] [--force] [--apply]     dry run unless --apply
 
-${C_BOLD}FOR AGENTS — WHAT EXISTS (no passphrase, no secrets)${C_RESET}
-  catalog [--json]            every item with its public facts (key ids, public keys, expiry)
+  Reading commands accept --recovery (open with the paper key: a new Mac) and
+  --via DEVICE (which device unlocks the biometric key; default: mac).
+
+${C_BOLD}FOR AGENTS — WHAT EXISTS (asks for nothing, no secrets)${C_RESET}
+  catalog [--json]            every item with its level and public facts
   find <text> [--json]        search ids, descriptions and metadata
   describe <id>               everything known about one item, and how to borrow it
 
@@ -1567,24 +1899,21 @@ ${C_BOLD}FOR AGENTS — BORROWING (a human approves each loan)${C_RESET}
   request <id>… --reason TEXT [--ttl 30m]   ask; prints the approve command for the human
   request <id>… --reason TEXT --run -- <cmd…>
                               one-shot: the human approves this exact command, it runs once
-                              during approval, keys are wiped; collect with 'result'
   result <grant>              a one-shot's output and exit status
-  approve [ID] [--ttl T]      human, at a terminal: review and grant (passphrase)
+  approve [ID] [--ttl T]      human, at a terminal: review, then unlock what the items need
   grant <id>… --reason TEXT [--ttl T]       human: request + approve in one step
   exec <grant> -- <cmd…>      run a command with \$KV_<ID> pointing at each granted file
   env <grant>                 the same paths, as export lines
   grants                      what is pending or on loan right now
   revoke <grant> | --all      end a loan early (anyone may)
 
-${C_BOLD}THE SAFE, OPENED BY HAND${C_RESET}
-  open [VAULT] / close / abort      several edits on one passphrase entry
-  status                            is anything unlocked right now?
-  doctor                            check tools, config and every declared source
+  status                      keys, vault files, archive
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
-  KEYVAULT_DEST         where the artifact lives    (default: 'dest' in the config, else iCloud Drive/Keyvault)
+  KEYVAULT_DEST         where the vault lives       (default: 'dest' in the config, else iCloud Drive/Keyvault)
   KEYVAULT_CONF         config file                 (default: ~/.config/keyvault/keyvault.conf)
-  KEYVAULT_IDENTITY     age identity file — makes every command non-interactive
+  KEYVAULT_KEYS         key directory               (default: next to the config, keys/)
+  KEYVAULT_UNLOCK_VIA   default for --via
   KEYVAULT_SPARKLE_BIN  directory holding generate_keys and sign_update
 
 Config lives in ${C_BOLD}$(tildify "$KV_CONF")${C_RESET} and is plain bash. See README.md.
@@ -1605,9 +1934,9 @@ main() {
         validate|check)     cmd_validate "$@" ;;
         restore)            cmd_restore "$@" ;;
         card)               cmd_card "$@" ;;
-        open)               session_open "${1:-$KV_ARTIFACT}" create; cmd_status ;;
-        close|seal)         session_close ;;
-        abort|discard)      session_abort ;;
+        setup)              cmd_setup "$@" ;;
+        recovery-check)     cmd_recovery_check "$@" ;;
+        open|close|abort)   die "'$cmd' is gone in 2.0: writes never ask for anything any more, so there is no session to hold open" ;;
         status)             cmd_status ;;
         doctor)             cmd_doctor "$@" ;;
         edit)               "${EDITOR:-vi}" "$KV_CONF" ;;

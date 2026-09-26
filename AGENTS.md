@@ -24,5 +24,5 @@ tests/test_secret.sh && tests/test_secret.sh --bash32
 gitleaks dir . && gitleaks git .        # if installed
 ```
 
-The suites never touch the real keychain, config or artifact. `test_secret.sh` must never
+The suites never touch the real keychain, config, keys or vault. `test_secret.sh` must never
 read an `--ask` item: that raises a dialog on the developer's screen.

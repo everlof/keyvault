@@ -1,57 +1,84 @@
 # keyvault
 
-**Back up the keys you can never get back, and let AI agents use them without handing them
-over.**
+**Back up the keys you can never get back, unlock them with Touch ID, and let AI agents
+use them without handing them over.**
 
 Some keys have no reset button. Lose a Sparkle update-signing key and no installed copy of
 your app will ever accept an update again. App Store Connect API keys can be downloaded once.
 GitHub App keys are shown once. A SOPS master key decrypts everything its project ever
-encrypted. These usually live in exactly one place: a keychain, or a loose file in a cloud
-folder.
+encrypted. 2FA recovery codes are, by definition, the thing you need when everything else is
+gone. These usually live in exactly one place: a keychain, or a loose file in a cloud folder.
 
-keyvault collects them into one `age`-encrypted file you can copy anywhere. Separately, it lets
-coding agents (Claude Code, Codex, …) find out which keys exist, and borrow one for a single
-job, with a human approving each loan.
-
-```
-keyvault pack        →  ~/Library/Mobile Documents/com~apple~CloudDocs/Keyvault/keyvault.age
-```
+keyvault collects them into an `age`-encrypted vault you can copy anywhere. Every item has a
+**level**: Touch ID, your passphrase, or both. A **recovery key** on paper opens everything on
+a new machine. Coding agents (Claude Code, Codex, …) can find out which keys exist and borrow
+one for a single job, with you approving each loan.
 
 It is three small tools, bash and `age` only, for macOS:
 
 | | For | Where secrets live |
 |---|---|---|
-| **`keyvault`** | keys that cannot be re-issued | one encrypted artifact, passphrase-protected |
+| **`keyvault`** | keys that cannot be re-issued, recovery codes | an age-encrypted vault; per item Touch ID, passphrase, or both |
 | **`secret`** | everyday tokens (API keys, deploy tokens) | the macOS login keychain |
 | **`guardrails/`** | stopping agents from simply reading key files | Claude Code / Codex settings |
 
-## Why an encrypted file, and not just…
+## Why an encrypted vault, and not just…
 
 - **…plaintext in iCloud Drive?** Every process on every synced machine can read it, and so
   can anyone who gets into your Apple ID.
 - **…only the keychain?** One dead SSD or stolen laptop and it is gone. Login-keychain items
   such as signing identities do not sync through iCloud Keychain.
 
-Encrypt once, then copy freely. When the bytes are useless without the passphrase, "where do I
-keep it" stops being a security question and becomes a durability question. The answer to
-that is always *more copies*.
+Encrypt once, then copy freely. When the bytes are useless without a key, "where do I keep
+it" stops being a security question and becomes a durability question. The answer to that
+is always *more copies*.
 
 ## Install
 
 ```bash
-brew install everlof/tap/keyvault      # keyvault and secret, plus age and jq
+brew install everlof/tap/keyvault      # keyvault and secret, with age, jq and age-plugin-se
 keyvault init                # writes ~/.config/keyvault/keyvault.conf from the example
-keyvault edit                # say what to collect
+keyvault setup               # creates the keys: Touch ID, passphrase, recovery (on paper)
+keyvault edit                # say what to collect, and at which level
 keyvault doctor              # check every source is where the config says
-keyvault pack                # collect, encrypt, write the artifact (asks for a passphrase)
+keyvault pack                # collect and encrypt; asks for nothing but macOS's Keychain prompts
+keyvault verify              # open every level and check every item
 ```
 
 Working on keyvault itself? `./install.sh` in a checkout links `keyvault` and `secret` into
 `~/.local/bin` instead, so edits take effect immediately. Don't mix the two installs: use
 one or the other.
 
-The passphrase is stored nowhere. Put it in a password manager **and** on paper, in
-different places. `keyvault card` prints a recovery sheet to keep with it.
+## Keys and levels
+
+`keyvault setup` creates three keys, each protecting against something different:
+
+| Key | Unlocked by | Lives | Stops |
+|---|---|---|---|
+| **biometric** | Touch ID | wrapped by this Mac's Secure Enclave ([age-plugin-se](https://github.com/remko/age-plugin-se)) | someone who learned your passphrase |
+| **passphrase** | your passphrase | wrapped with scrypt | an agent on your Mac, which cannot type it |
+| **recovery** | you, reading it off paper | **nowhere on any computer** | losing the Mac |
+
+Every item in the vault gets a level:
+
+| Level | Opens everyday with | On a new Mac |
+|---|---|---|
+| `biometric` | Touch ID | the recovery key |
+| `passphrase` | the passphrase | the recovery key |
+| `both` | Touch ID **and** the passphrase | the recovery key |
+
+`both` is real layered encryption: an inner layer to the biometric key, an outer layer to
+the passphrase key. Every layer is also encrypted to the recovery key.
+
+- **Writing needs only public keys.** `pack`, `add` and `remove` never ask for anything.
+- **Reading asks for what the items need, once per command.** A `.p8` costs one touch; a
+  Sparkle key at `both` costs a touch and the passphrase.
+- **The recovery key is what makes `both` mean something.** Anyone who steals your passphrase
+  still needs Touch ID on this Mac, or the paper.
+
+`setup` shows the recovery key once and asks you to confirm its last characters; it is never
+written to disk. `keyvault card` prints a sheet to write it on, and `keyvault
+recovery-check` tells you later whether the paper copy is right.
 
 ## The config
 
@@ -61,66 +88,79 @@ it stays out of any repository. See [`keyvault.conf.example`](keyvault.conf.exam
 ```bash
 dest "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Keyvault"
 
-sparkle my-app --plist "$HOME/src/my-app/Resources/Info.plist"   # from the login keychain
-identities login.keychain-db                                     # every signing identity, as one .p12
-glob "$HOME/.appstoreconnect/private_keys" '*.p8'                # a folder that grows
-file "$HOME/.config/sops/age/keys.txt" --id sops-age             # one file
+sparkle my-app --plist "$HOME/src/my-app/Resources/Info.plist" --level both
+identities login.keychain-db --level both                        # every signing identity, as one .p12
+glob "$HOME/.appstoreconnect/private_keys" '*.p8'                # biometric, the default
+level passphrase                                                 # the default from here on
+file "$HOME/.config/sops/age/keys.txt" --id sops-age
 
 meta AuthKey_ABCDE12345.p8 issuer_id=… used_by=my-app            # facts for agents (below)
 ```
 
-For anything one-off: `keyvault add NAME --file PATH`, or `keyvault add NAME --secret` to
-type a value in. Added items carry across every future `pack`.
+Anything one-off, like recovery codes, goes in with `keyvault add`:
+
+```bash
+keyvault add github-recovery-codes --file ~/Downloads/github-recovery-codes.txt --level both
+pbpaste | keyvault add apple-id-recovery-key --stdin --level both
+keyvault add some-totp-seed --secret --level passphrase        # one line, typed without echo
+```
+
+Added items get a file of their own, carry across every future `pack`, and default to
+`biometric` unless you say otherwise.
 
 ## Is the backup any good?
 
 Two different questions, two commands:
 
-**`keyvault verify`: is the artifact itself sound?** Fully offline: no keychain, no
-network. It re-derives every Sparkle public key from its stored private key, opens the `.p12`
-with its stored password, and checksums every file. Run it on a *different* machine: "my
-backup is fine" is a claim worth testing somewhere other than where it was made.
+**`keyvault verify`: is the vault itself sound?** It opens every level and checks every item:
+Sparkle private keys derive to their recorded public keys, the `.p12` opens with its stored
+password, and every file matches its checksum. `verify --recovery` does the same with only the
+recovery key, which is the check that matters: can you get in without this Mac?
 
-**`keyvault validate`: does it still describe this machine?** It answers the questions
-that go stale. Is there a certificate in the keychain the vault has never seen? A new key in a
-folder you glob? A file that changed on disk? And the important one: does the backed-up
-Sparkle key still match the `SUPublicEDKey` your shipped app carries? If those disagree, the
-key you are guarding is not the one your users' installs accept, and you would find out on
-release day. Exit status 0 means it matches, 2 means out of date (run `pack`), and 1 means
-something is wrong.
+**`keyvault validate`: does it still describe this machine?** It answers the questions that go
+stale. Is there a certificate in the keychain the vault has never seen? A new key in a folder
+you glob? A file that changed on disk? And the important one: does the backed-up Sparkle key
+still match the `SUPublicEDKey` your shipped app carries? If those disagree, the key you are
+guarding is not the one your users' installs accept, and you would find out on release day.
+Exit status 0 means it matches, 2 means out of date (run `pack`), and 1 means something is
+wrong.
 
-## Restoring onto a dead machine
+## Restoring onto a new machine
 
-You do not need this tool:
+You need the recovery key, and nothing but `age`:
 
 ```bash
 brew install age
-age --decrypt keyvault.age | tar -xzv
-cat vault/manifest.json          # what every file is, and where it belongs
+printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt
+cd Keyvault/keyvault
+for f in *.age added/*.age; do
+    cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+    tar -xzf x; mv vault "vault-$(basename "$f" .age)"
+done
+rm x ../r.txt                 # each vault-*/manifest.json says what is where
 ```
 
-With the tool, `keyvault restore` puts everything back. Sparkle keys go into the keychain,
-identities are imported, and files are written to their recorded paths and modes. It is a
-**dry run** unless you pass `--apply`, and it refuses to overwrite anything that differs
-unless you pass `--force`.
+With the tool, `keyvault restore --recovery` puts everything back. Sparkle keys go into the
+keychain, identities are imported, and files are written to their recorded paths and modes. It
+is a **dry run** unless you pass `--apply`, and it refuses to overwrite anything that differs
+unless you pass `--force`. Then run `keyvault setup` on the new Mac and `pack` again.
 
 ## How it handles plaintext
 
-Decrypted keys are only ever written to a **RAM disk** (`hdiutil attach ram://`, no sudo),
-which is unmounted when the work is done and cannot survive a reboot. A temp directory can't
-make that promise, because deleting a file on APFS does not overwrite it. If a RAM disk cannot
-be created, keyvault falls back to a `700` temp directory and says so loudly.
+Decrypted keys, and the unwrapped Touch ID and passphrase keys, are only ever written to a
+**RAM disk** (`hdiutil attach ram://`, no sudo), which is unmounted when the command exits,
+however it exits, and cannot survive a reboot. A temp directory can't make that promise,
+because deleting a file on APFS does not overwrite it. If a RAM disk cannot be created,
+keyvault falls back to a `700` temp directory and says so loudly.
 
-A command that fails never reseals the vault, so a broken write cannot replace a good
-artifact. The previous ten artifacts are kept in `archive/`.
+A pack is all or nothing: if any source fails, nothing on disk changes. Every change first
+copies the vault to `archive/`, which keeps the last ten.
 
 ## Agents: knowing what exists, borrowing what they need
 
-The vault answers two questions for an agent, and neither one hands over the passphrase.
-
-**What is in there?** Sealing the vault also writes `catalog.json` next to it. It lists
-every item's id, kind and public facts, and no secrets. The facts are derived from the keys
-themselves:
+**What is in there?** Every pack, add and remove updates `catalog.json` next to the vault. It
+lists every item's id, level, kind and public facts, and no secrets. The facts are derived
+from the keys themselves:
 
 - an App Store Connect key's id
 - a certificate's subject and expiry
@@ -142,7 +182,7 @@ keyvault describe AuthKey_ABCDE12345.p8   # one item, plus how it would be used
 ```bash
 keyvault request sparkle-my-app --reason "sign the 1.4 update" \
     --run -- sign_update --ed-key-file '$KV_SPARKLE_MY_APP' MyApp-1.4.zip
-keyvault approve kv-5e6f7a8b      # you: shows the command, the binary it resolves to, the directory
+keyvault approve kv-5e6f7a8b      # you: the command, the binary, each item's level; then Touch ID / passphrase
 keyvault result kv-5e6f7a8b       # the agent: stdout, stderr, exit status
 ```
 
@@ -159,19 +199,22 @@ keyvault exec kv-1a2b3c4d -- xcrun notarytool submit MyApp.zip --key "$KV_AUTHKE
 keyvault revoke kv-1a2b3c4d       # or let it expire
 ```
 
-Only the granted items are copied, onto a RAM disk of their own, and the full vault is
-closed again before anything is handed out. A detached watcher unmounts it when the TTL runs
-out (30 minutes by default, 12 hours at most). The watcher takes its deadline and location
-from its own arguments, never from the grant record, so the grantee cannot extend its loan.
-Every request, approval, denial, use, revocation and expiry is logged to
-`~/.local/state/keyvault/audit.log`.
+Approval decrypts only the files that hold the requested items, so it asks only for what
+their levels need. Only the granted items are copied, onto a RAM disk of their own. A detached
+watcher unmounts it when the TTL runs out (30 minutes by default, 12 hours at most). The
+watcher takes its deadline and location from its own arguments, never from the grant record,
+so the grantee cannot extend its loan. Every request, approval, denial, use, revocation and
+expiry is logged to `~/.local/state/keyvault/audit.log`.
 
 ### What that does and does not protect
 
-**What stops an agent approving its own request is the passphrase.** An agent's shell has
-no controlling terminal, so it can neither answer `approve`'s prompt nor type the passphrase
-`age` asks for. That means an identity file (`KEYVAULT_IDENTITY`, which makes age
-non-interactive) must never be visible to an agent.
+**An agent cannot approve its own request.** Its shell has no terminal: it can neither answer
+`approve`'s prompt nor type the passphrase.
+
+**Touch ID is the weaker gate against agents.** An agent can run `age` against the biometric
+key itself, and a Touch ID dialog appears on your screen that says little about who is asking
+or why. Touch the sensor only when *you* just started something. Anything an agent must never
+reach on its own belongs at `passphrase` or `both`.
 
 A grant is **scope, time, a human decision and a record**. It is not a sandbox: while a grant
 is live, any process running as you can read the granted files. It protects against an agent
@@ -231,14 +274,14 @@ sandbox holds against that. Rules still stop the accidental read, which is the c
 ## Commands
 
 ```
-keyvault init | edit | doctor | status
-keyvault pack [--fresh] | list | verify | validate | card
-keyvault add <id> --file PATH | --secret | --stdin  [--desc T] [--meta k=v] [--restore-to P]
+keyvault init | setup | edit | doctor | status | card | recovery-check
+keyvault pack | list | verify | validate
+keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
 keyvault remove <id> | show <id> --out PATH
 keyvault restore [--only ID] [--force] [--apply]
-keyvault open | close | abort                     several edits on one passphrase entry
+    reading commands also take --recovery (the paper key) and --via DEVICE
 
-keyvault catalog | find <text> | describe <id>    no passphrase, no secrets
+keyvault catalog | find <text> | describe <id>    asks for nothing, shows no secrets
 keyvault request <id>… --reason T [--ttl 30m] [--run -- <cmd…>]
 keyvault approve [ID] | grant <id>… --reason T    a human at a terminal
 keyvault exec <grant> -- <cmd…> | env <grant> | result <grant>
@@ -248,19 +291,33 @@ keyvault grants | revoke <grant> | --all
 | Variable | |
 |---|---|
 | `KEYVAULT_CONF` | config file (default `~/.config/keyvault/keyvault.conf`) |
+| `KEYVAULT_KEYS` | key directory (default `keys/` next to the config) |
 | `KEYVAULT_DEST` | overrides `dest` from the config |
-| `KEYVAULT_IDENTITY` | an age identity file instead of a passphrase: for automation and tests only, never where an agent can see it |
+| `KEYVAULT_UNLOCK_VIA` | default for `--via` (default `mac`) |
 | `KEYVAULT_SPARKLE_BIN` | directory holding Sparkle's `generate_keys` and `sign_update` (found in DerivedData otherwise) |
-| `KEYVAULT_ARCHIVE_KEEP` | previous artifacts to keep (default 10) |
+| `KEYVAULT_ARCHIVE_KEEP` | earlier versions to keep (default 10) |
 | `SECRET_KEYCHAIN` | keychain for `secret` (default: login) |
+
+The test suite also uses `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY` and
+`KEYVAULT_RECOVERY_IDENTITY` to stand plain age keys in for the Secure Enclave, the passphrase
+and the paper. Anyone who can set them does not need keyvault's permission: never set them in
+an environment an agent can see.
+
+## Coming next
+
+**Face ID on your iPhone, via Threading.** The biometric key is
+one key, wrapped once per device (`keys/biometric.<device>.age`). A paired iPhone becomes one
+more wrap. Approving a loan with `--via iphone` sends the request to the phone, you approve it
+with Face ID, and the phone unwraps the key for that one command. Nothing is re-encrypted, and
+the Mac never waits on a Touch ID sensor you are nowhere near.
 
 ## Design notes
 
 - **Bash 3.2.** That is what stock macOS ships, and the machine you are restoring onto will
   not have Homebrew yet. `keyvault` is one file for the same reason; the agent features live
   in `keyvault-access.sh`, which recovery never needs.
-- **A passphrase, not an identity file.** An identity file is a second secret that needs its
-  own backup, which is the problem this tool exists to solve.
+- **Three factors, one of them on paper.** The recovery key never touches a computer, so
+  stealing your passphrase or your Mac is not enough on its own.
 - **Say what you left out.** A config that records, in comments, what was considered and
   rejected is worth as much as the inclusions: it separates "not backed up" from "decided not
   to".
@@ -268,14 +325,16 @@ keyvault grants | revoke <grant> | --all
 ## Tests
 
 ```bash
-tests/test_keyvault.sh            # the whole lifecycle, on synthetic keys, in identity mode
+tests/test_keyvault.sh            # the whole lifecycle, on synthetic keys
 tests/test_keyvault.sh --bash32   # the same under /bin/bash 3.2
 tests/test_secret.sh              # against a throwaway keychain; your login keychain is never touched
 ```
 
-They never touch your keychain, config or artifact. Several cases exist because a real key
-broke the tool once: a symlinked key, a filename with spaces, two files claiming one id, a
-glob over the destination folder, a glob whose single failure used to be swallowed.
+They never touch your keychain, config, keys or vault, and they behave the same in a
+terminal and in CI. Setup, approvals and a real scrypt passphrase run through a pty. Several
+cases exist because a real key broke the tool once: a symlinked key, a filename with spaces,
+two files claiming one id, a glob over the destination folder, a glob whose single failure
+used to be swallowed.
 
 ## License
 

@@ -9,24 +9,32 @@
 #
 # Directives:
 #
-#   dest <path>
-#       Where the encrypted artifact, its archive and catalog.json live. Somewhere that
-#       syncs is the point: the artifact is useless without the passphrase, so it can go
-#       anywhere. Default: ~/Library/Mobile Documents/com~apple~CloudDocs/Keyvault
+#   level <biometric|passphrase|both>
+#       What it takes to open everything declared after this line (default: biometric).
+#       Any source can also take its own --level. Every level also opens with the
+#       recovery key from `keyvault setup`.
+#         biometric    Touch ID
+#         passphrase   the passphrase you type (an agent cannot)
+#         both         Touch ID and the passphrase
 #
-#   sparkle <keychain-account> [--plist PATH] [--desc TEXT]
+#   dest <path>
+#       Where the encrypted vault, its archive and catalog.json live. Somewhere that
+#       syncs is the point: the vault is useless without its keys, so it can go anywhere.
+#       Default: ~/Library/Mobile Documents/com~apple~CloudDocs/Keyvault
+#
+#   sparkle <keychain-account> [--plist PATH] [--desc TEXT] [--level L]
 #       A Sparkle ed25519 update-signing key from the login keychain. --plist points at
 #       the Info.plist that ships the matching SUPublicEDKey; `keyvault validate` then
 #       proves the backed-up key still signs updates installed copies will accept.
 #
-#   identities <keychain> [--desc TEXT]
+#   identities <keychain> [--desc TEXT] [--level L]
 #       Every code-signing identity (certificate + private key) in a keychain, exported
 #       as one .p12. macOS asks once per key — click Allow.
 #
-#   file <path> [--id NAME] [--desc TEXT]
+#   file <path> [--id NAME] [--desc TEXT] [--level L]
 #       One file, restored to the same path with the same mode.
 #
-#   glob <dir> <pattern> [--desc TEXT]
+#   glob <dir> <pattern> [--desc TEXT] [--level L]
 #       Every file in <dir> matching <pattern>. For folders that grow: new keys are
 #       picked up without editing this file, and `validate` tells you when one appears.
 #
@@ -47,13 +55,13 @@
 #
 # Lose a Sparkle key and no installed copy of the app can be updated again.
 
-# sparkle my-app \
+# sparkle my-app --level both \
 #     --plist "$HOME/src/my-app/Resources/Info.plist" \
 #     --desc "MyApp Sparkle update-signing key."
 
 # ---------------------------------------------------------------- painful to re-issue
 
-# identities login.keychain-db \
+# identities login.keychain-db --level both \
 #     --desc "Developer ID and Apple Distribution certificates with their private keys."
 
 # App Store Connect API keys can be downloaded exactly once, at creation.
@@ -65,7 +73,10 @@
 #     --id github-app-my-app --desc "GitHub App private key for my-app."
 
 # A SOPS/age master key decrypts every secret the project ever encrypted.
-# file "$HOME/.config/sops/age/keys.txt" --id sops-age --desc "SOPS age master key."
+# file "$HOME/.config/sops/age/keys.txt" --id sops-age --level both --desc "SOPS age master key."
+
+# Recovery codes and one-off secrets go in with `keyvault add`, not here:
+#   keyvault add github-recovery-codes --file ~/Downloads/github-recovery-codes.txt --level both
 
 # ---------------------------------------------------------------- for agents
 #
