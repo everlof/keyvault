@@ -1289,12 +1289,28 @@ cmd_secret() {
         set)       secret_set "$sb" "$@" ;;
         rm|remove) secret_rm "$sb" "$@" ;;
         backup)    secret_backup "$sb" ;;
+        help|--help|-h|"") secret_help ;;
         request)   # an agent asks the user for a token it never sees: agent access lives there
                    # shellcheck source=keyvault-access.sh
                    source "$KV_ROOT/keyvault-access.sh" || die "keyvault-access.sh is missing"
                    secret_request "$sb" "$@" ;;
         *)         exec "$sb" "$sub" "$@" ;;
     esac
+}
+
+secret_help() {
+    cat <<EOF
+${C_BOLD}keyvault secret${C_RESET} — tokens in the macOS keychain, one command at a time, backed up in keyvault
+
+  set NAME [--ask] [--desc T] [--stdin]   store it (typed, or piped), and seal a copy in the vault
+                                         --ask: every use raises the keychain dialog
+  request NAME --desc T     for agents: a dialog asks the user for the value; the agent never sees it
+  run NAME [VAR=NAME …] -- <command…>    run with those tokens in the environment, for that command only
+  list [--json]             names and descriptions, never values
+  get NAME                  print one value: for pasting by hand, never in scripts, never by agents
+  rm NAME                   delete it, and its copy in the vault
+  backup                    copy tokens stored with plain 'secret', or changed since their copy
+EOF
 }
 
 secret_set() {
@@ -2178,8 +2194,12 @@ cmd_init() {
 # ---------------------------------------------------------------------------- help
 
 cmd_help() {
+    [[ ${1:-} == agents ]] && { cmd_help_agents; return 0; }
     cat <<EOF
-${C_BOLD}keyvault${C_RESET} $KV_VERSION — an encrypted backup of every key you cannot re-issue
+${C_BOLD}keyvault${C_RESET} $KV_VERSION — an encrypted backup of every key you cannot re-issue, and your tokens
+
+${C_BOLD}An AI agent? Read 'keyvault help agents' first:${C_RESET} how to find, use and store keys and
+tokens without ever seeing one, and which commands are not yours to run.
 
 ${C_BOLD}SETTING UP${C_RESET}
   init                        create your config from keyvault.conf.example
@@ -2205,8 +2225,9 @@ ${C_BOLD}TOKENS — the 'secret' tool, backed up${C_RESET}
   secret set NAME [--ask] [--desc T] [--stdin]   store a token, and seal a copy in the vault
   secret rm NAME              remove it, and its copy
   secret backup               copy the tokens stored with plain 'secret' (once)
-  secret request NAME --desc T   for agents: a dialog asks the user for the value; the agent never sees it
-  secret run NAME -- <cmd…>   run with it in the environment (list, get: as 'secret')
+  secret request NAME --desc T
+                              for agents: a dialog asks the user for the value; the agent never sees it
+  secret run NAME -- <cmd…>   run with it in the environment      ('keyvault secret help' for all)
 
 ${C_BOLD}PUTTING IT BACK${C_RESET}
   restore [--only ID] [--force] [--apply]     dry run unless --apply
@@ -2244,6 +2265,46 @@ Config lives in ${C_BOLD}$(tildify "$KV_CONF")${C_RESET} and is plain bash. See 
 EOF
 }
 
+# What an agent needs, in the order it needs it. docs/agents.md is the long form.
+cmd_help_agents() {
+    cat <<EOF
+${C_BOLD}keyvault for agents${C_RESET} — keys and tokens you can find, use and store without ever seeing one
+
+${C_BOLD}FIND${C_RESET}  (asks nothing, shows no value)
+  keyvault catalog            every key and token: id, LEVEL, kind, public facts
+  keyvault find <text>        e.g. an app, a team id, a key id, "loopia"
+  keyvault describe <id>      everything known about one, and exactly how to use it
+
+${C_BOLD}USE A TOKEN${C_RESET}  (LEVEL run or ask)
+  keyvault secret run NAME -- <command…>          \$NAME is set for that command only
+  keyvault secret run TOOL_VAR=NAME -- <command…> under the name the tool expects
+  ask: every use raises a dialog the user must click. Tell them before you run it.
+
+${C_BOLD}USE A KEY${C_RESET}  (LEVEL biometric, passphrase or both: only the user can unlock it)
+  keyvault request <id> --reason "…" --run -- <command…>
+        the user approves that exact command; it runs once. Then: keyvault result <grant>
+  keyvault request <id>… --reason "…" [--ttl 30m]
+        a loan. Tell the user to run 'keyvault approve <grant>', then wait.
+        Then: keyvault exec <grant> -- <command…>   (\$KV_<ID> is the file's path)
+        and:  keyvault revoke <grant>               as soon as you are done
+
+${C_BOLD}STORE ONE${C_RESET}  (only when the user asks you to)
+  a token:     keyvault secret request NAME --desc "what it is, what it is for"
+               A dialog asks the user for the value; it goes into the keychain and the
+               vault and never passes through you. Never ask for it in the chat.
+  a key file:  keyvault add <id> --file PATH --level both --desc "what it is"
+               The file is sealed as it is. Don't open, print or copy it.
+  If the user pasted a secret into the chat, it is exposed: use 'secret request' anyway, so
+  it is typed where you cannot see it, and suggest they rotate it.
+
+${C_BOLD}NEVER${C_RESET}
+  Print, copy or log a value: no 'secret get', no cat of a granted file, no echo of \$NAME.
+  Run 'show', 'restore', 'verify', 'validate', 'pack', 'remove', 'setup', 'approve' or 'grant':
+  they are the user's, and several put a Touch ID or passphrase prompt on their screen.
+  Run age against ~/.config/keyvault/keys, or set KEYVAULT_*_IDENTITY or KEYVAULT_DIALOG.
+EOF
+}
+
 # ---------------------------------------------------------------------------- dispatch
 
 main() {
@@ -2273,7 +2334,7 @@ main() {
             source "$KV_ROOT/keyvault-access.sh" || die "keyvault-access.sh is missing"
             access_main "$cmd" "$@" ;;
         version|--version)  say "keyvault $KV_VERSION" ;;
-        help|--help|-h)     cmd_help ;;
+        help|--help|-h)     cmd_help "$@" ;;
         *)                  die "unknown command '$cmd' — try 'keyvault help'" ;;
     esac
 }

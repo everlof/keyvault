@@ -3,6 +3,7 @@
 `keyvault catalog` is the one place to look for anything auth- or key-related on this
 machine: the vault's keys and the everyday tokens `secret` keeps. It shows what exists,
 what it is for and how to use it. It never shows a value, and looking costs nothing.
+`keyvault help agents` is the short version of this page.
 
 This machine keeps its irreplaceable keys in keyvault: Sparkle update keys, code-signing
 identities, App Store Connect `.p8` keys, GitHub App keys, the SOPS master key, recovery
@@ -63,6 +64,12 @@ with a backup in the vault, and you never see it. They also choose whether you m
 freely or whether every use asks them first. Then use it with `keyvault secret run`.
 Name it the way the tool expects (`UPPER_SNAKE`), and say in `--desc` what it is for.
 
+**Asked to back up a key file?** Seal it as it is, without opening it:
+
+    keyvault add <id> --file ~/Downloads/AuthKey_ABCDE12345.p8 --level both --desc "ASC key for my-app"
+
+Only when the user asks you to. It asks for nothing, and `keyvault catalog` shows it next time.
+
 Items marked `ask` raise a macOS dialog the user must click. If one appears, tell them what
 you are running and why. Never use `secret get` in scripts, or print a value.
 
@@ -83,8 +90,11 @@ in case".
 ## Never
 
 - Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY`, `KEYVAULT_RECOVERY_IDENTITY`
-  or `KEYVAULT_DIALOG`, or run `setup`, `show`, `restore`, `verify`, `pack`, `add` or
-  `remove`. Those are the user's commands.
+  or `KEYVAULT_DIALOG`, or run `setup`, `show`, `restore`, `verify`, `validate`, `pack`,
+  `remove`, `approve` or `grant`. Those are the user's commands, and several put a Touch ID
+  or passphrase prompt on their screen.
+- Use `secret get`, or `add --stdin` / `secret set --stdin` with a value you were given.
+  A value that passed through you is exposed; use `keyvault secret request`.
 - Read `/Volumes/keyvault-*` directly, or copy granted files elsewhere.
 - Copy a key into a repo, a `.env`, a log, a chat message or a CI secret without being asked
   to, in so many words.

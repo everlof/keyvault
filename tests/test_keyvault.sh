@@ -447,6 +447,14 @@ grep -q "$(age-keygen -y "$WORK/recovery.id")" <<<"$out" && ok "card carries the
 grep -q "${RECOVERY_SECRET:16:20}" <<<"$out" && no "card never carries the recovery key itself" || ok "card never carries the recovery key itself"
 out="$(kv help 2>/dev/null)"
 grep -q 'restore' <<<"$out" && grep -q 'setup' <<<"$out" && ok "help renders" || no "help renders"
+grep -q "keyvault help agents" <<<"$(kv help 2>&1 | head -5)" && ok "help points agents to their page first" || no "help points agents to their page first"
+out="$(kv help agents 2>&1)"
+for c in "keyvault catalog" "keyvault secret run" "keyvault request" "keyvault secret request" "keyvault add" "NEVER"; do
+    grep -q "$c" <<<"$out" && ok "help agents covers: $c" || no "help agents covers: $c" "$out"
+done
+out="$(kv secret help 2>&1)"
+grep -q 'request NAME' <<<"$out" && grep -q 'backup' <<<"$out" && ok "keyvault secret help is keyvault's, not plain secret's" \
+    || no "keyvault secret help is keyvault's, not plain secret's" "$out"
 out="$(kv status 2>/dev/null)"
 grep -q 'both.age' <<<"$out" && ok "status lists the vault files" || no "status lists the vault files" "$out"
 out="$(kv open 2>&1)"
