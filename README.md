@@ -39,14 +39,16 @@ that is always *more copies*.
 ## Install
 
 ```bash
-brew install age jq
-git clone https://github.com/everlof/keyvault && cd keyvault
-./install.sh                 # links keyvault and secret into ~/.local/bin
+brew install everlof/tap/keyvault      # keyvault and secret, plus age and jq
 keyvault init                # writes ~/.config/keyvault/keyvault.conf from the example
 keyvault edit                # say what to collect
 keyvault doctor              # check every source is where the config says
 keyvault pack                # collect, encrypt, write the artifact (asks for a passphrase)
 ```
+
+Working on keyvault itself? `./install.sh` in a checkout links `keyvault` and `secret` into
+`~/.local/bin` instead, so edits take effect immediately. Don't mix the two installs: use
+one or the other.
 
 The passphrase is stored nowhere. Put it in a password manager **and** on paper, in
 different places. `keyvault card` prints a recovery sheet to keep with it.
@@ -208,9 +210,10 @@ Permission rules and a sandbox, so that "agents can't just read the key files" i
 rather than hoped for. Nothing is applied until you pass `--apply`.
 
 ```bash
-guardrails/apply.sh                         # dry run: every Claude Code profile, permission rules
-guardrails/apply.sh --apply                 # write, backing up each settings.json first
-guardrails/apply.sh --layer sandbox --only ~/.claude   # try the sandbox in one profile
+G="$(brew --prefix keyvault)/libexec/guardrails"   # or ./guardrails in a checkout
+$G/apply.sh                                 # dry run: every Claude Code profile, permission rules
+$G/apply.sh --apply                         # write, backing up each settings.json first
+$G/apply.sh --layer sandbox --only ~/.claude           # try the sandbox in one profile
 ```
 
 | Layer | Enforces | Cost |
