@@ -224,51 +224,6 @@ plist_public_key() {
     /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null
 }
 
-# ---------------------------------------------------------------------------- workspace
-#
-# Plaintext lives on a RAM disk and nowhere else. `diskutil erasevolume` on a ram:// device
-# needs no sudo, and the volume cannot survive a reboot — which is the one guarantee a
-# temp directory on an SSD can never give you.
-
-workspace_create() {   # workspace_create [mount] [sectors] [pinned]  -> "<mount>\t<device>"
-    local want="${1:-$KV_MOUNT}" sectors="${2:-$KV_RAMDISK_SECTORS}" pinned="${3:-}"
-    [[ -n $pinned ]] || { [[ -n ${KEYVAULT_MOUNT:-} ]] && pinned=1 || pinned=0; }
-    local name dev=""
-    name="$(basename "$want")"
-    if (( ! KV_NO_RAMDISK )); then
-        dev="$(hdiutil attach -nomount "ram://$sectors" 2>/dev/null | tr -d '[:space:]')"
-    fi
-    if [[ -n $dev ]] && diskutil erasevolume HFS+ "$name" "$dev" >/dev/null 2>&1; then
-        chmod 700 "/Volumes/$name" 2>/dev/null
-        printf '%s\t%s\n' "/Volumes/$name" "$dev"
-        return 0
-    fi
-    [[ -n $dev ]] && hdiutil detach "$dev" >/dev/null 2>&1
-    local tmp
-    if (( pinned )); then
-        # An explicit mount point is honoured on both paths, so a caller that pins one
-        # (the test suite does) always knows where the plaintext is.
-        tmp="$want"
-        rm -rf "$tmp" && mkdir -p "$tmp" || die "cannot create a workspace at $tmp"
-    else
-        tmp="$(mktemp -d "${TMPDIR:-/tmp}/$name.XXXXXXXX")" || die "cannot create a workspace"
-    fi
-    chmod 700 "$tmp"
-    info "${C_YELLOW}!${C_RESET} could not create a RAM disk; falling back to $tmp"
-    info "  plaintext will briefly touch this disk. It is removed on close, but not overwritten."
-    printf '%s\t%s\n' "$tmp" ""
-}
-
-workspace_destroy() {
-    local mount="$1" dev="$2"
-    if [[ -n $dev ]]; then
-        hdiutil detach "$dev" >/dev/null 2>&1 || hdiutil detach "$dev" -force >/dev/null 2>&1
-    elif [[ -n $mount && -d $mount ]]; then
-        find "$mount" -type f -exec rm -f {} + 2>/dev/null
-        rm -rf "$mount"
-    fi
-}
-
 # ---------------------------------------------------------------------------- keys
 #
 # Three factors, three age keys:
@@ -283,7 +238,8 @@ workspace_destroy() {
 # asks for anything. Reading unwraps each factor it needs once per command, onto the
 # RAM disk, and every layer of every file is also encrypted to the recovery key.
 
-recipient_of() { awk -v f="$1" '$1 == f { print $2 }' "$KV_KEYS/recipients" 2>/dev/null; }
+KV_RECIPIENTS=""   # setup points this at the new keys while it re-seals the vault to them
+recipient_of() { awk -v f="$1" '$1 == f { print $2 }' "${KV_RECIPIENTS:-$KV_KEYS/recipients}" 2>/dev/null; }
 keys_ready()   { [[ -n $(recipient_of recovery) && -n $(recipient_of biometric) && -n $(recipient_of passphrase) ]]; }
 keys_require() { keys_ready || die "no keys yet — run 'keyvault setup' first"; }
 
@@ -331,12 +287,15 @@ factor_unlock() {   # factor_unlock <biometric|passphrase|recovery>
                 local k
                 printf 'Recovery key (AGE-SECRET-KEY-1…, not echoed): ' >/dev/tty
                 IFS= read -rs k <&4; printf '\n' >/dev/tty; exec 4<&-
-                # Typed from paper: forgive spaces, line breaks and lower case.
+                # Typed from paper: forgive spaces, line breaks, lower case, and leaving out the
+                # AGE-SECRET-KEY-1 the card prints for you. Bech32 data never holds a '1', so
+                # a leading one can only be the prefix's.
                 k="$(printf '%s' "$k" | tr -d ' \t\r\n-' | tr '[:lower:]' '[:upper:]')"
-                k="AGE-SECRET-KEY-${k#AGESECRETKEY}"
-                [[ $k == AGE-SECRET-KEY-1* ]] || die "that is not an age secret key"
+                k="${k#AGESECRETKEY}"; k="AGE-SECRET-KEY-1${k#1}"
                 ( umask 077; printf '%s\n' "$k" > "$out" )
             fi
+            age-keygen -y "$out" >/dev/null 2>&1 \
+                || { rm -f "$out"; die "that is not an age secret key — check each character against the card"; }
             local want; want="$(recipient_of recovery)"
             if [[ -n $want && "$(age-keygen -y "$out" 2>/dev/null)" != "$want" ]]; then
                 rm -f "$out"; die "that is not the recovery key this vault was made with"
@@ -391,15 +350,22 @@ unseal() {
 workspace_create() {   # workspace_create [mount] [sectors] [pinned]  -> "<mount>\t<device>"
     local want="${1:-$KV_MOUNT}" sectors="${2:-$KV_RAMDISK_SECTORS}" pinned="${3:-}"
     [[ -n $pinned ]] || { [[ -n ${KEYVAULT_MOUNT:-} ]] && pinned=1 || pinned=0; }
-    local name dev=""
-    name="$(basename "$want")"
+    local name dev="" base mnt i=1
+    name="$(basename "$want")"; base="$name"
+    # Never share a volume: one left by a killed run, or a second command at the same time,
+    # would already hold that name, and macOS would mount ours as "<name> 1".
+    while [[ -e /Volumes/$name ]]; do name="$base-$((i++))"; done
     if (( ! KV_NO_RAMDISK )); then
         dev="$(hdiutil attach -nomount "ram://$sectors" 2>/dev/null | tr -d '[:space:]')"
     fi
     if [[ -n $dev ]] && diskutil erasevolume HFS+ "$name" "$dev" >/dev/null 2>&1; then
-        chmod 700 "/Volumes/$name" 2>/dev/null
-        printf '%s\t%s\n' "/Volumes/$name" "$dev"
-        return 0
+        # Where it really mounted, not where we hoped: never write into someone else's volume.
+        mnt="$(diskutil info "$dev" 2>/dev/null | sed -n 's/^ *Mount Point: *//p')"
+        if [[ -n $mnt && -d $mnt ]]; then
+            chmod 700 "$mnt" 2>/dev/null
+            printf '%s\t%s\n' "$mnt" "$dev"
+            return 0
+        fi
     fi
     [[ -n $dev ]] && hdiutil detach "$dev" >/dev/null 2>&1
     local tmp
@@ -473,7 +439,8 @@ store_files() {   # "<level>\t<path>\t<adhoc>" per file
     return 0
 }
 store_exists() { [[ -n $(store_files) ]]; }
-added_file()   { local f; for f in "$KV_ADDED/$1".*.age; do [[ -f $f ]] && { printf '%s\n' "$f"; return 0; }; done; return 1; }
+# Exactly <id>.<level>.age: ids may hold dots, and a glob would let 'foo' match 'foo.bar.both.age'.
+added_file()   { local l; for l in $KV_LEVELS; do [[ -f $KV_ADDED/$1.$l.age ]] && { printf '%s\n' "$KV_ADDED/$1.$l.age"; return 0; }; done; return 1; }
 keychain_file() { local l; for l in $KV_LEVELS; do [[ -f $KV_KEYCHAIN/$1.$l.age ]] && { printf '%s\n' "$KV_KEYCHAIN/$1.$l.age"; return 0; }; done; return 1; }
 
 # Copy the whole store aside before any change: a bad pack or add is recoverable, and
@@ -1860,14 +1827,17 @@ cmd_card() {
 
   TO OPEN THE VAULT WITH NOTHING BUT age (brew install age):
 
-      printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt          # the key above
-      cd keyvault/
+      printf '%s\n' 'AGE-SECRET-KEY-1…' > /tmp/r.txt     # the key above
+      cp -R keyvault /tmp/kv && cd /tmp/kv               # a copy: never open it in the synced folder
       for f in *.age keychain/*.age added/*.age; do
           [ -f "\$f" ] || continue
-          cp "\$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+          cp "\$f" x
+          while grep -q 'BEGIN AGE' x; do
+              age -d -i /tmp/r.txt x > y && mv y x || { echo "the key does not open \$f"; break 2; }
+          done
           tar -xzf x; mv vault "vault-\$(basename "\$f" .age)"
       done
-      rm x ../r.txt                                        # each vault-*/manifest.json lists what is where
+      rm -f x y /tmp/r.txt      # vault-*/manifest.json says what is where; rm -rf /tmp/kv when done
 
   Or with keyvault installed:   keyvault restore --recovery
 
@@ -2064,14 +2034,17 @@ without one of those.
 TO OPEN IT on any machine, with the recovery key:
 
     brew install age
-    printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt
-    cd keyvault
+    printf '%s\n' 'AGE-SECRET-KEY-1…' > /tmp/r.txt
+    cp -R keyvault /tmp/kv && cd /tmp/kv       # a copy: never open it in this synced folder
     for f in *.age keychain/*.age added/*.age; do
         [ -f "\$f" ] || continue
-        cp "\$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+        cp "\$f" x
+        while grep -q 'BEGIN AGE' x; do
+            age -d -i /tmp/r.txt x > y && mv y x || { echo "the key does not open \$f"; break 2; }
+        done
         tar -xzf x; mv vault "vault-\$(basename "\$f" .age)"
     done
-    rm x ../r.txt
+    rm -f x y /tmp/r.txt                       # and rm -rf /tmp/kv when you are done
 
 Each vault-*/manifest.json says what every file in its items/ is and where it belongs.
 
@@ -2092,11 +2065,12 @@ EOF
 # once, to be written down, and never stored.
 
 cmd_setup() {
-    local ac="any-biometry-or-passcode" force=0
+    local ac="any-biometry-or-passcode" force=0 recovery=0
     while (($#)); do
         case "$1" in
             --access-control) ac="$2"; shift 2 ;;
             --force)          force=1; shift ;;
+            --recovery)       recovery=1; shift ;;
             *) die "setup: unknown option '$1'" ;;
         esac
     done
@@ -2105,11 +2079,31 @@ cmd_setup() {
     if keys_ready && (( ! force )); then
         die "keys already exist in $(tildify "$KV_KEYS") — 'keyvault status' shows them"
     fi
-    if store_exists && (( force )); then
-        die "a vault already exists: new keys could not open it. Restore it, move $(tildify "$KV_STORE") aside, then run setup --force"
-    fi
     if [[ -z ${KEYVAULT_SE_IDENTITY:-} ]]; then
         have age-plugin-se || die "Touch ID needs age-plugin-se — run: brew install age-plugin-se"
+    fi
+
+    # 0. A vault that already exists is sealed to other keys: a new Mac's synced copy, or the
+    # current keys being replaced. Open all of it first — with its recovery key, or the current
+    # factors — so a wrong key changes nothing, and re-seal it to the new keys below; new keys
+    # that cannot read it would strand everything added by hand.
+    local rows="" l f a n=0
+    if store_exists; then
+        rows="$(store_files)"
+        step "0/3  the vault that is already there"
+        ws_open
+        if keys_ready && (( ! recovery )); then
+            info "  $(tildify "$KV_STORE") opens with the current keys; it moves to the new ones."
+        else
+            KV_RECOVERY=1
+            info "  $(tildify "$KV_STORE") was sealed to keys this Mac does not have. Its recovery key opens it,"
+            info "  and it moves to the new keys: the old recovery key will no longer open it."
+        fi
+        while IFS=$'\t' read -r l f a; do
+            [[ -n $f ]] || continue
+            unseal "$f" "$l" "$WS/reseal/$((++n))"    # a key that does not open it stops setup here
+        done <<<"$rows"
+        ok "opened $n file$( ((n > 1)) && echo s)"
     fi
 
     local tmp="$KV_KEYS.new"
@@ -2149,8 +2143,8 @@ cmd_setup() {
     # 3. recovery: shown once, stored nowhere.
     step "3/3  recovery key"
     local kr pr secret
-    if [[ -n ${KEYVAULT_RECOVERY_IDENTITY:-} ]]; then      # tests: a known key
-        kr="$(cat "$KEYVAULT_RECOVERY_IDENTITY")"
+    if [[ -n ${KEYVAULT_NEW_RECOVERY_IDENTITY:-${KEYVAULT_RECOVERY_IDENTITY:-}} ]]; then      # tests: a known key
+        kr="$(cat "${KEYVAULT_NEW_RECOVERY_IDENTITY:-$KEYVAULT_RECOVERY_IDENTITY}")"
     else
         kr="$(age-keygen 2>/dev/null)"
     fi
@@ -2175,16 +2169,41 @@ EOF
         printf '  That does not match. Look again.\n' >/dev/tty
     done
     secret=""
-    printf '\033[2J\033[H' >/dev/tty 2>/dev/null     # clear the screen: it is on paper now
+    printf '\033[2J\033[3J\033[H' >/dev/tty 2>/dev/null   # clear screen and scrollback: it is on paper now
     ok "recovery key confirmed — it is not stored anywhere"
 
     printf 'biometric %s\npassphrase %s\nrecovery %s\n' "$pb" "$pp" "$pr" > "$tmp/recipients"
     chmod 600 "$tmp"/*
+
+    # Re-seal what step 0 opened, to the new keys, before they replace anything.
+    if [[ -n $rows ]]; then
+        step "moving the vault to the new keys"
+        store_archive                                  # the old files, still sealed to the old keys
+        KV_RECIPIENTS="$tmp/recipients"; n=0
+        while IFS=$'\t' read -r l f a; do
+            [[ -n $f ]] || continue
+            n=$((n + 1))
+            tar -czf "$WS/tmp/reseal.tgz" -C "$WS/reseal/$n" vault && seal "$l" "$WS/tmp/reseal.tgz" "$f.new" \
+                || { rm -f "$KV_STORE"/*.age.new "$KV_KEYCHAIN"/*.age.new "$KV_ADDED"/*.age.new; rm -rf "$tmp"
+                     die "could not re-seal $(tildify "$f") — nothing was changed"; }
+            rm -f "$WS/tmp/reseal.tgz"
+        done <<<"$rows"
+        KV_RECIPIENTS=""
+    fi
+
     if [[ -d $KV_KEYS ]]; then
         mv "$KV_KEYS" "$KV_KEYS.old.$(stamp)" || die "could not move the old keys aside"
     fi
     mv "$tmp" "$KV_KEYS" || die "could not install the keys"
     ok "keys in $(tildify "$KV_KEYS")"
+    if [[ -n $rows ]]; then
+        while IFS=$'\t' read -r l f a; do
+            [[ -n $f ]] && mv -f "$f.new" "$f" && chmod 600 "$f"
+        done <<<"$rows"
+        catalog_save "$(catalog_items)"                # its recipients are the new keys now
+        ws_close
+        ok "the vault opens with the new keys — $n file$( ((n > 1)) && echo s); the archive keeps the old ones"
+    fi
     say ""
     say "Next: 'keyvault pack'. Print 'keyvault card' and keep it with the recovery key."
 }
@@ -2222,6 +2241,8 @@ tokens without ever seeing one, and which commands are not yours to run.
 ${C_BOLD}SETTING UP${C_RESET}
   init                        create your config from keyvault.conf.example
   setup                       create the keys: biometric (Touch ID), passphrase, recovery (paper)
+                              a vault already there moves to them: on a new Mac its old recovery key
+                              opens it; setup --force replaces keys the same way (--recovery: paper key)
   doctor                      check tools, keys, config and every declared source
 
 ${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passphrase · both

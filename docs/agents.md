@@ -97,10 +97,10 @@ in case".
 
 ## Never
 
-- Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY`, `KEYVAULT_RECOVERY_IDENTITY`
-  or `KEYVAULT_DIALOG`, or run `setup`, `show`, `restore`, `verify`, `validate`, `pack`,
-  `remove`, `approve` or `grant`. Those are the user's commands, and several put a Touch ID
-  or passphrase prompt on their screen.
+- Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY`, `KEYVAULT_RECOVERY_IDENTITY`,
+  `KEYVAULT_NEW_RECOVERY_IDENTITY` or `KEYVAULT_DIALOG`, or run `setup`, `show`, `restore`,
+  `verify`, `validate`, `pack`, `remove`, `approve` or `grant`. Those are the user's commands,
+  and several put a Touch ID or passphrase prompt on their screen.
 - Use `secret get`, or `add --stdin` / `secret set --stdin` with a value you were given.
   A value that passed through you is exposed; use `keyvault secret request`.
 - Read `/Volumes/keyvault-*` directly, or copy granted files elsewhere.

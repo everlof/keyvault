@@ -92,6 +92,14 @@ bare()  { notty env -u KEYVAULT_SE_IDENTITY -u KEYVAULT_PASSPHRASE_IDENTITY -u K
 onpty() { local input="$1"; shift; python3 "$ROOT/tests/onpty.py" "$input" "$@"; }
 
 STORE="$WORK/dest/keyvault"
+# The recovery recipe exactly as 'keyvault card' prints it, with /tmp swapped for a folder of
+# this run's own: what is tested is what a person on a new Mac would type.
+recipe() {   # recipe <folder holding keyvault/> <recovery key file> <work dir>
+    mkdir -p "$3" && cp "$2" "$3/r.txt"
+    "$SHELL_BIN" "$KV" card 2>/dev/null | sed -n '/cp -R keyvault/,/rm -f x y/p' \
+        | sed "s|/tmp/r.txt|$3/r.txt|g; s|/tmp/kv|$3/kv|g; s/  *# .*$//" > "$3/recipe.sh"
+    (cd "$1" && perl -e 'alarm 60; exec @ARGV' sh "$3/recipe.sh")
+}
 store_hash() { find "$STORE" -type f -name '*.age' -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256; }
 # The factors, unwrapped by hand: what a test needs to peel a layer on its own.
 unwrap() { age -d -i "$WORK/se.id" "$KEYVAULT_KEYS/biometric.mac.age" > "$WORK/kbio"
@@ -206,6 +214,16 @@ kv recovery-check >/dev/null 2>&1
 check "the right recovery key checks out" "$?" "0"
 KEYVAULT_RECOVERY_IDENTITY="$WORK/wrong.id" kv recovery-check >/dev/null 2>&1 \
     && no "a wrong recovery key is refused" || ok "a wrong recovery key is refused"
+# Typed from paper. The card prints AGE-SECRET-KEY-1 for you, so people write down the rest.
+typed() { env -u KEYVAULT_RECOVERY_IDENTITY python3 "$ROOT/tests/onpty.py" "$1"$'\n' "$SHELL_BIN" "$KV" recovery-check 2>&1; }
+SUFFIX="${RECOVERY_SECRET#AGE-SECRET-KEY-1}"
+typed "$SUFFIX" >/dev/null
+check "the key typed without the AGE-SECRET-KEY-1 the card prints checks out" "$?" "0"
+typed "$(printf '%s' "$SUFFIX" | tr '[:upper:]' '[:lower:]' | sed 's/.\{8\}/& /g')" >/dev/null
+check "lower case and spaces are forgiven" "$?" "0"
+typed "$RECOVERY_SECRET" >/dev/null
+check "the whole key still works" "$?" "0"
+grep -q 'not an age secret key' <<<"$(typed "NOT A KEY AT ALL")" && ok "something that is not a key is refused" || no "something that is not a key is refused"
 
 # ---------------------------------------------------------------------------- lifecycle
 
@@ -305,6 +323,15 @@ kv list 2>/dev/null | grep -q '^apppw ' && no "and it is no longer listed" || ok
 out="$(kv remove alpha 2>&1)"
 [[ $? -ne 0 ]] && grep -q 'keyvault.conf' <<<"$out" && ok "a declared item is removed in the config, not here" || no "a declared item is removed in the config, not here" "$out"
 kv remove nosuchthing >/dev/null 2>&1 && no "removing an unknown id fails" || ok "removing an unknown id fails"
+# Ids may hold dots; 'dotted' must never be taken for 'dotted.child'.
+printf 'CHILD' | kv add dotted.child --stdin >/dev/null 2>&1
+printf 'PARENT' | kv add dotted --stdin --level passphrase >/dev/null 2>&1
+[[ -f $STORE/added/dotted.child.biometric.age ]] && ok "adding 'dotted' leaves 'dotted.child' alone" || no "adding 'dotted' leaves 'dotted.child' alone" "$(ls "$STORE/added")"
+kv remove dotted >/dev/null 2>&1
+[[ -f $STORE/added/dotted.child.biometric.age ]] && ok "removing 'dotted' leaves 'dotted.child' alone" || no "removing 'dotted' leaves 'dotted.child' alone" "$(ls "$STORE/added")"
+[[ -e $STORE/added/dotted.passphrase.age ]] && no "and removes 'dotted' itself" || ok "and removes 'dotted' itself"
+check "'dotted.child' still reads back" "$(kv show dotted.child --stdout 2>/dev/null)" "CHILD"
+kv remove dotted.child >/dev/null 2>&1
 
 group "restore"
 kv pack >/dev/null 2>&1
@@ -461,21 +488,20 @@ out="$(kv open 2>&1)"
 [[ $? -ne 0 ]] && grep -q '2.0' <<<"$out" && ok "the old session commands explain themselves" || no "the old session commands explain themselves" "$out"
 
 group "the vault opens with nothing but age, tar and the recovery key"
-# Exactly the recipe on the card and in the README, run by hand.
-mkdir -p "$WORK/manual" && cp -R "$STORE" "$WORK/manual/" && (
-    cd "$WORK/manual/keyvault" && cp "$WORK/recovery.id" ../r.txt
-    for f in *.age keychain/*.age added/*.age; do
-        [ -f "$f" ] || continue
-        cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
-        tar -xzf x; mv vault "vault-$(basename "$f" .age)"
-    done
-    rm -f x ../r.txt
-)
-check "every file opened" "$(ls -d "$WORK/manual/keyvault"/vault-*/ 2>/dev/null | wc -l | tr -d ' ')" "$(ls "$STORE"/*.age "$STORE"/keychain/*.age "$STORE"/added/*.age 2>/dev/null | wc -l | tr -d ' ')"
-grep -rq 'PRIVATE-KEY-ALPHA' "$WORK/manual/keyvault"/vault-both/items 2>/dev/null \
+before="$(store_hash)"
+recipe "$WORK/dest" "$WORK/recovery.id" "$WORK/manual"
+check "the card's recipe runs to the end" "$?" "0"
+check "every file opened" "$(ls -d "$WORK/manual/kv"/vault-*/ 2>/dev/null | wc -l | tr -d ' ')" "$(ls "$STORE"/*.age "$STORE"/keychain/*.age "$STORE"/added/*.age 2>/dev/null | wc -l | tr -d ' ')"
+grep -rq 'PRIVATE-KEY-ALPHA' "$WORK/manual/kv"/vault-both/items 2>/dev/null \
     && ok "the both level, two layers deep, is readable" || no "the both level, two layers deep, is readable"
-jq -e '[.items[] | select(.type=="file")] | length > 0' "$WORK/manual/keyvault/vault-biometric/manifest.json" >/dev/null 2>&1 \
+jq -e '[.items[] | select(.type=="file")] | length > 0' "$WORK/manual/kv/vault-biometric/manifest.json" >/dev/null 2>&1 \
     && ok "manifests say where every file belongs" || no "manifests say where every file belongs"
+[[ -z $(find "$STORE" -name 'vault-*' -o -name x -o -name y) && $(store_hash) == "$before" ]] \
+    && ok "it works on a copy: nothing is decrypted in the synced folder" || no "it works on a copy: nothing is decrypted in the synced folder"
+[[ -e $WORK/manual/r.txt ]] && no "and deletes the key file it made" || ok "and deletes the key file it made"
+out="$(recipe "$WORK/dest" "$WORK/wrong.id" "$WORK/wrongkey" 2>&1)"; rc=$?
+[[ $rc != 142 ]] && grep -q 'does not open' <<<"$out" && ok "a wrong key stops the recipe instead of looping forever" \
+    || no "a wrong key stops the recipe instead of looping forever" "rc=$rc $out"
 
 group "a real passphrase, end to end (scrypt, through a terminal)"
 # Everything above uses a stand-in for the passphrase. This is the real thing.
@@ -493,6 +519,47 @@ grep -q 'internally sound' <<<"$out" && ok "typing it opens every level" || no "
 out="$(realkv python3 "$ROOT/tests/onpty.py" $'wrong horse\n' "$SHELL_BIN" "$KV" verify 2>&1)"
 grep -q 'wrong passphrase' <<<"$out" && ok "a wrong passphrase is refused" || no "a wrong passphrase is refused" "$out"
 [[ -e $P/mount ]] && no "and leaves no workspace" || ok "and leaves no workspace"
+
+# ---------------------------------------------------------------------------- new keys, old vault
+
+group "setup on a new Mac moves the vault to the new keys"
+# The old Mac packs, and adds something by hand; the new one has the synced vault and no keys.
+M="$WORK/newmac"; mkdir -p "$M"
+printf 'file "%s" --id alpha --level both\n' "$WORK/src/alpha.key" > "$M/keyvault.conf"
+menv() { env KEYVAULT_CONF="$M/keyvault.conf" KEYVAULT_KEYS="$M/keys" KEYVAULT_DEST="$M/dest" \
+             KEYVAULT_STATE="$M/state" KEYVAULT_MOUNT="$M/mount" "$@"; }
+mkv()  { menv "${NOTTY[@]}" "$SHELL_BIN" "$KV" "$@"; }
+msetup() { local six="$1"; shift; menv "$@" python3 "$ROOT/tests/onpty.py" "$six"$'\n' "$SHELL_BIN" "$KV" setup; }
+msetup "$LAST6" >/dev/null 2>&1 && mkv pack >/dev/null 2>&1
+printf 'RECOVERY-CODES' | mkv add codes --stdin --level both >/dev/null 2>&1
+mv "$M/keys" "$M/keys.old-mac"
+age-keygen -o "$WORK/recovery2.id" >/dev/null 2>&1; age-keygen -o "$WORK/recovery3.id" >/dev/null 2>&1
+six() { local k; k="$(grep '^AGE-SECRET-KEY-' "$1")"; printf '%s' "${k: -6}"; }
+before="$(find "$M/dest/keyvault" -name '*.age' -exec shasum -a 256 {} + | sort | shasum)"
+out="$(msetup "$(six "$WORK/recovery2.id")" KEYVAULT_RECOVERY_IDENTITY="$WORK/wrong.id" KEYVAULT_NEW_RECOVERY_IDENTITY="$WORK/recovery2.id" 2>&1)"; rc=$?
+[[ $rc != 0 && ! -d $M/keys ]] && ok "a key that does not open the vault stops setup before anything changes" \
+    || no "a key that does not open the vault stops setup before anything changes" "$out"
+check "the vault is untouched" "$(find "$M/dest/keyvault" -name '*.age' -exec shasum -a 256 {} + | sort | shasum)" "$before"
+out="$(msetup "$(six "$WORK/recovery2.id")" KEYVAULT_NEW_RECOVERY_IDENTITY="$WORK/recovery2.id" 2>&1)"; rc=$?
+check "setup with the old recovery key succeeds" "$rc" "0"
+grep -q 'does not have' <<<"$out" && ok "and says the vault moves to the new keys" || no "and says the vault moves to the new keys" "$out"
+mkv verify >/dev/null 2>&1
+check "the new keys open all of it" "$?" "0"
+check "the item added by hand came along" "$(mkv show codes --stdout 2>/dev/null)" "RECOVERY-CODES"
+KEYVAULT_RECOVERY_IDENTITY="$WORK/recovery2.id" mkv verify --recovery >/dev/null 2>&1
+check "the new recovery key opens it" "$?" "0"
+KEYVAULT_RECOVERY_IDENTITY="$WORK/recovery.id" mkv verify --recovery >/dev/null 2>&1 \
+    && no "the old recovery key no longer does" || ok "the old recovery key no longer does"
+[[ -n $(ls -d "$M/dest/archive"/[0-9]*/ 2>/dev/null) ]] && ok "the old files are kept in the archive" || no "the old files are kept in the archive"
+check "the catalog names the new recovery key" "$(jq -r '.recipients.recovery' "$M/dest/catalog.json")" "$(age-keygen -y "$WORK/recovery2.id")"
+[[ -e $M/mount ]] && no "and leaves no workspace" || ok "and leaves no workspace"
+
+group "setup --force replaces the keys the same way"
+out="$(menv KEYVAULT_NEW_RECOVERY_IDENTITY="$WORK/recovery3.id" python3 "$ROOT/tests/onpty.py" "$(six "$WORK/recovery3.id")"$'\n' "$SHELL_BIN" "$KV" setup --force 2>&1)"; rc=$?
+check "setup --force with a vault exits 0" "$rc" "0"
+check "the replaced keys still open everything" "$(mkv show codes --stdout 2>/dev/null)" "RECOVERY-CODES"
+KEYVAULT_RECOVERY_IDENTITY="$WORK/recovery3.id" mkv verify --recovery >/dev/null 2>&1
+check "with the newest recovery key too" "$?" "0"
 
 # ---------------------------------------------------------------------------- agent access
 #
@@ -806,17 +873,9 @@ check "and the .p12 holds it" "$(p12_holds)" "one three two "
 sed -i '' 's/--desc "signing identities"/--desc "all signing identities"/' "$I/keyvault.conf"
 ikv pack >/dev/null 2>&1
 check "a changed description means a new export" "$(exports)" "4"
-mkdir -p "$I/manual" && cp -R "$I/dest/keyvault" "$I/manual/" && (
-    cd "$I/manual/keyvault" && cp "$WORK/recovery.id" ../r.txt
-    for f in *.age keychain/*.age added/*.age; do
-        [ -f "$f" ] || continue
-        cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
-        tar -xzf x; mv vault "vault-$(basename "$f" .age)"
-    done
-    rm -f x ../r.txt
-)
-[[ -f $I/manual/keyvault/vault-identities-test.both/items/identities-test/identities.p12 ]] \
-    && ok "the recipe on the card opens keychain/ too" || no "the recipe on the card opens keychain/ too" "$(ls "$I/manual/keyvault")"
+recipe "$I/dest" "$WORK/recovery.id" "$I/manual" >/dev/null 2>&1
+[[ -f $I/manual/kv/vault-identities-test.both/items/identities-test/identities.p12 ]] \
+    && ok "the recipe on the card opens keychain/ too" || no "the recipe on the card opens keychain/ too" "$(ls "$I/manual/kv" 2>&1)"
 sed -i '' '/^identities /d' "$I/keyvault.conf"
 ikv pack >/dev/null 2>&1
 [[ -e $IFILE ]] && no "dropping the line drops its file" || ok "dropping the line drops its file"
@@ -963,6 +1022,14 @@ if [[ $(uname) == Darwin ]]; then
         ok "a RAM disk mounts without sudo"
         mounts="$(mount)"
         grep -q "$mount_path" <<<"$mounts" && ok "the workspace is a real mount" || no "the workspace is a real mount"
+        # A second one while the first is mounted: a concurrent command, or one a killed run left.
+        out2="$(KEYVAULT_NO_RAMDISK=0 KEYVAULT_MOUNT=/Volumes/keyvault-selftest \
+                KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; workspace_create")"
+        mount2="${out2%%$'\t'*}"; dev2="${out2##*$'\t'}"
+        [[ -n $dev2 && $mount2 != "$mount_path" && -d $mount2 ]] && ok "a second workspace gets a volume of its own" \
+            || no "a second workspace gets a volume of its own" "first=[$mount_path] second=[$mount2]"
+        [[ -n $dev2 ]] && echo x > "$mount2/probe" && KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; workspace_destroy '$mount2' '$dev2'"
+        [[ -e $mount_path/probe ]] && no "and never writes into the first" || ok "and never writes into the first"
         KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; workspace_destroy '$mount_path' '$dev'"
         [[ -d $mount_path ]] && no "the RAM disk detaches" || ok "the RAM disk detaches"
     else

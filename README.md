@@ -131,20 +131,28 @@ You need the recovery key, and nothing but `age`:
 
 ```bash
 brew install age
-printf '%s\n' 'AGE-SECRET-KEY-1…' > r.txt
-cd Keyvault/keyvault
+printf '%s\n' 'AGE-SECRET-KEY-1…' > /tmp/r.txt
+cp -R Keyvault/keyvault /tmp/kv && cd /tmp/kv    # a copy: never open it inside the synced folder
 for f in *.age keychain/*.age added/*.age; do
     [ -f "$f" ] || continue
-    cp "$f" x; while grep -q 'BEGIN AGE' x; do age -d -i ../r.txt x > y && mv y x; done
+    cp "$f" x
+    while grep -q 'BEGIN AGE' x; do
+        age -d -i /tmp/r.txt x > y && mv y x || { echo "the key does not open $f"; break 2; }
+    done
     tar -xzf x; mv vault "vault-$(basename "$f" .age)"
 done
-rm x ../r.txt                 # each vault-*/manifest.json says what is where
+rm -f x y /tmp/r.txt          # vault-*/manifest.json says what is where; rm -rf /tmp/kv when done
 ```
 
 With the tool, `keyvault restore --recovery` puts everything back. Sparkle keys go into the
 keychain, identities are imported, and files are written to their recorded paths and modes. It
 is a **dry run** unless you pass `--apply`, and it refuses to overwrite anything that differs
-unless you pass `--force`. Then run `keyvault setup` on the new Mac and `pack` again.
+unless you pass `--force`. Then run `keyvault setup` on the new Mac. It sees the vault that
+synced in, asks for its recovery key once, and moves every file to the new keys, including
+the items and tokens you added by hand, which no `pack` could rebuild. It shows you a new
+recovery key: write that one down, because the old one no longer opens the vault (the
+archive keeps copies sealed to it). `setup --force` replaces keys on the same Mac the same
+way.
 
 ## How it handles plaintext
 
