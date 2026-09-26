@@ -1,0 +1,14 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install age jq
+      - name: keyvault
+        run: tests/test_keyvault.sh
+      - name: keyvault (bash 3.2)
+        run: tests/test_keyvault.sh --bash32
+      - name: secret
+        run: tests/test_secret.sh

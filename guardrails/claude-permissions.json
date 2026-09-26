@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/id_*)",
+      "Read(~/.aws/credentials)",
+      "Read(~/.config/sops/age/**)",
+      "Read(~/Library/Application Support/sops/age/**)",
+      "Read(~/.appstoreconnect/**)",
+      "Read(~/.gnupg/private-keys-v1.d/**)",
+      "Read(//Volumes/keyvault-*/**)"
+    ],
+    "ask": [
+      "Read(**/.env)",
+      "Read(**/.env.local)",
+      "Read(**/.env.*.local)",
+      "Read(**/.dev/*.env)",
+      "Bash(security find-generic-password *)",
+      "Bash(security find-internet-password *)",
+      "Bash(security dump-keychain *)",
+      "Bash(security export *)",
+      "Bash(sops -d *)",
+      "Bash(sops --decrypt *)",
+      "Bash(sops decrypt *)",
+      "Bash(age -d *)",
+      "Bash(age --decrypt *)",
+      "Bash(secret get *)",
+      "Bash(keyvault show *)",
+      "Bash(keyvault open *)",
+      "Bash(keyvault restore *)",
+      "Bash(aws * --profile prod*)"
+    ]
+  }
+}

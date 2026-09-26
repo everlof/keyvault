@@ -1,0 +1,20 @@
+# Nothing secret should ever be able to land in this repository.
+#
+# The vault artifact lives in iCloud Drive, not here, but a mistyped --out or a
+# stray export must not become a commit. These patterns are deliberately broad.
+
+*.age
+*.p12
+*.p8
+*.pem
+*.key
+*.pfx
+*.mobileprovision
+private-key*
+*secret*
+vaults/
+out/
+.DS_Store
+
+# Your config lives in ~/.config/keyvault/; a copy here must never be committed.
+keyvault.conf

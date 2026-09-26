@@ -1,0 +1,75 @@
+# keyvault.conf — what `keyvault pack` collects.
+#
+# `keyvault init` copies this to ~/.config/keyvault/keyvault.conf. That copy is yours:
+# it names your keys and where they live, so it never belongs in a repository.
+#
+# The file is plain bash that keyvault sources, so quoting, $HOME, variables and comments
+# all behave the way you expect. Nothing in it is secret: account names, paths and public
+# keys only. The keys themselves are never written here.
+#
+# Directives:
+#
+#   dest <path>
+#       Where the encrypted artifact, its archive and catalog.json live. Somewhere that
+#       syncs is the point: the artifact is useless without the passphrase, so it can go
+#       anywhere. Default: ~/Library/Mobile Documents/com~apple~CloudDocs/Keyvault
+#
+#   sparkle <keychain-account> [--plist PATH] [--desc TEXT]
+#       A Sparkle ed25519 update-signing key from the login keychain. --plist points at
+#       the Info.plist that ships the matching SUPublicEDKey; `keyvault validate` then
+#       proves the backed-up key still signs updates installed copies will accept.
+#
+#   identities <keychain> [--desc TEXT]
+#       Every code-signing identity (certificate + private key) in a keychain, exported
+#       as one .p12. macOS asks once per key — click Allow.
+#
+#   file <path> [--id NAME] [--desc TEXT]
+#       One file, restored to the same path with the same mode.
+#
+#   glob <dir> <pattern> [--desc TEXT]
+#       Every file in <dir> matching <pattern>. For folders that grow: new keys are
+#       picked up without editing this file, and `validate` tells you when one appears.
+#
+#   meta <id> key=value …
+#       Facts an agent needs to *use* an item without seeing it — an App Store Connect
+#       issuer id, which app a key serves. Published in catalog.json. Key ids, certificate
+#       subjects and expiry, and public keys are derived on their own.
+#
+# Anything added with `keyvault add` is carried across repacks and needs no line here.
+#
+# A good question for every line: can this be re-issued in an afternoon? If yes, it
+# probably does not belong here — a backup of a revocable token widens the blast radius
+# more than it saves you. Write down what you left out, and why, as comments.
+
+# dest "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Keyvault"
+
+# ---------------------------------------------------------------- cannot be re-issued
+#
+# Lose a Sparkle key and no installed copy of the app can be updated again.
+
+# sparkle my-app \
+#     --plist "$HOME/src/my-app/Resources/Info.plist" \
+#     --desc "MyApp Sparkle update-signing key."
+
+# ---------------------------------------------------------------- painful to re-issue
+
+# identities login.keychain-db \
+#     --desc "Developer ID and Apple Distribution certificates with their private keys."
+
+# App Store Connect API keys can be downloaded exactly once, at creation.
+# glob "$HOME/.appstoreconnect/private_keys" '*.p8' \
+#     --desc "App Store Connect API keys."
+
+# GitHub App private keys are shown once at generation.
+# file "$HOME/Documents/my-github-app.private-key.pem" \
+#     --id github-app-my-app --desc "GitHub App private key for my-app."
+
+# A SOPS/age master key decrypts every secret the project ever encrypted.
+# file "$HOME/.config/sops/age/keys.txt" --id sops-age --desc "SOPS age master key."
+
+# ---------------------------------------------------------------- for agents
+#
+# Issuer ids: appstoreconnect.apple.com → Users and Access → Integrations.
+#
+# meta AuthKey_XXXXXXXXXX.p8 issuer_id=<uuid> used_by=my-app
+# meta sparkle-my-app app=MyApp

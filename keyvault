@@ -1,0 +1,1629 @@
+#!/usr/bin/env bash
+#
+# keyvault — one encrypted artifact holding every key this machine cannot re-issue.
+#
+# The whole tool is this one bash file on purpose. It is a *recovery* tool: the day you
+# need it most is the day you are staring at a fresh Mac with no Xcode, no toolchain and
+# no build step available. Everything here runs on stock macOS plus `age`.
+#
+# See README.md for the model. The short version:
+#
+#   keyvault init              create ~/.config/keyvault/keyvault.conf from the example
+#   keyvault pack              collect what keyvault.conf declares -> <dest>/keyvault.age
+#   keyvault validate          does the vault still match this machine?
+#   keyvault verify            is the vault internally sound? (offline, no keychain)
+#   keyvault add / remove      put one more thing in, take one thing out
+#   keyvault restore           put it all back, dry-run by default
+#   keyvault catalog / find    what is in it, for agents — no passphrase (keyvault-access.sh)
+#   keyvault request / approve lend specific items to an agent for a while
+#
+# Written to run under bash 3.2, which is what a stock macOS install ships. Homebrew
+# bash is fine too, but a machine you are restoring onto will not have it.
+#
+set -uo pipefail
+
+readonly KV_VERSION="1.0.0"
+readonly KV_MANIFEST_VERSION=1
+
+# ---------------------------------------------------------------------------- paths
+
+kv_script_dir() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [[ -L $src ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ $src != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+readonly KV_ROOT="$(kv_script_dir)"
+
+# The config is yours, not the tool's: it names your keys and where they live, so it sits
+# outside the repository, and the repository ships only keyvault.conf.example.
+readonly KV_CONF="${KEYVAULT_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/keyvault/keyvault.conf}"
+readonly KV_STATE="${KEYVAULT_STATE:-$HOME/.local/state/keyvault}"
+readonly KV_SESSION="$KV_STATE/session.json"
+
+readonly KV_DEST_DEFAULT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Keyvault"
+
+# `dest PATH` in the config says where the artifact lives. The config is sourced for real
+# only when a command needs the sources, so read just this one line here, in a subshell
+# where every other directive is a no-op.
+conf_dest() {
+    [[ -f $KV_CONF ]] || return 0
+    (
+        sparkle() { :; }; identities() { :; }; file() { :; }; glob() { :; }; meta() { :; }
+        dest() { printf '%s\n' "$1" >&3; }      # fd 3: the config's own output is discarded
+        # shellcheck disable=SC1090
+        source "$KV_CONF" 3>&1 >/dev/null 2>&1
+    ) | tail -1
+}
+KV_DEST="${KEYVAULT_DEST:-}"
+[[ -n $KV_DEST ]] || KV_DEST="$(conf_dest)"
+[[ -n $KV_DEST ]] || KV_DEST="$KV_DEST_DEFAULT"
+readonly KV_DEST
+readonly KV_ARTIFACT="$KV_DEST/keyvault.age"
+readonly KV_CATALOG="$KV_DEST/catalog.json"
+readonly KV_ARCHIVE="$KV_DEST/archive"
+readonly KV_ARCHIVE_KEEP="${KEYVAULT_ARCHIVE_KEEP:-10}"
+
+readonly KV_MOUNT="${KEYVAULT_MOUNT:-/Volumes/keyvault-session}"
+readonly KV_RAMDISK_SECTORS="${KEYVAULT_RAMDISK_SECTORS:-262144}"   # 512-byte sectors -> 128 MB
+readonly KV_NO_RAMDISK="${KEYVAULT_NO_RAMDISK:-0}"                  # tests exercise the fallback
+
+# An age identity file makes every operation non-interactive. Unset (the default) means
+# passphrase mode, which is the right default for a human: an identity file is itself a
+# secret you would then have to back up somewhere, and that is the problem we came to solve.
+KV_IDENTITY="${KEYVAULT_IDENTITY:-}"
+
+# Set by commands that opened a session implicitly, so the exit trap knows to close it.
+KV_AUTO_OPENED=0
+KV_AUTO_SAVE=0
+
+# ---------------------------------------------------------------------------- output
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    readonly C_RESET=$'\033[0m' C_DIM=$'\033[2m' C_BOLD=$'\033[1m'
+    readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_BLUE=$'\033[34m'
+else
+    readonly C_RESET= C_DIM= C_BOLD= C_RED= C_GREEN= C_YELLOW= C_BLUE=
+fi
+
+say()   { printf '%s\n' "$*"; }
+info()  { printf '%s\n' "$*" >&2; }
+step()  { printf '%s==>%s %s\n' "$C_BLUE$C_BOLD" "$C_RESET" "$*" >&2; }
+ok()    { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+bad()   { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; }
+warn()  { printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+note()  { printf '  %s·%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+dim()   { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+
+die() { printf '%skeyvault:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------- utilities
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+stamp()   { date +%Y%m%d-%H%M%S; }
+
+# Collapse a leading $HOME to "~" so a vault restores cleanly under a different username.
+tildify() {
+    local p="$1"
+    [[ $p == "$HOME"/* ]] && printf '~%s\n' "${p#"$HOME"}" || printf '%s\n' "$p"
+}
+untildify() {
+    local p="$1"
+    [[ $p == "~"/* ]] && printf '%s\n' "$HOME${p#\~}" || printf '%s\n' "$p"
+}
+
+file_mode() { stat -f '%Lp' "$1"; }
+
+# Resolve a symlink chain to the real file. Keys are routinely symlinked into the place a
+# tool expects them from wherever they actually live (~/.appstoreconnect/private_keys is
+# exactly this), and a backup that stores the link instead of the bytes is not a backup.
+# BSD readlink only grew -f recently, so walk it by hand.
+resolve_path() {
+    local p="$1" d b t i=0
+    while (( i++ < 16 )); do
+        d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || break
+        b="$(basename "$p")"
+        [[ -L $d/$b ]] || { printf '%s/%s\n' "$d" "$b"; return 0; }
+        t="$(readlink "$d/$b")"
+        [[ $t == /* ]] || t="$d/$t"
+        p="$t"
+    done
+    printf '%s\n' "$p"
+}
+
+random_password() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40; }
+
+# Sparkle's own tools, wherever SPM last unpacked them. Only pack/restore need these;
+# verify derives public keys itself, so a machine without Xcode can still check a vault.
+kv_sparkle_bin() {
+    if [[ -n ${KEYVAULT_SPARKLE_BIN:-} ]]; then
+        printf '%s\n' "$KEYVAULT_SPARKLE_BIN"; return 0
+    fi
+    local d
+    d="$(ls -dt "$HOME"/Library/Developer/Xcode/DerivedData/*/SourcePackages/artifacts/sparkle/Sparkle/bin 2>/dev/null | head -1)"
+    [[ -n $d && -x $d/generate_keys ]] || return 1
+    printf '%s\n' "$d"
+}
+
+# ------------------------------------------------------------- ed25519, without a keychain
+#
+# Sparkle exports the private key as base64 of either the 32-byte seed or the 64-byte
+# libsodium secret key (seed || public). Both forms appear in the wild, so handle both —
+# and when the 64-byte form is given, cross-check that its trailing public half agrees
+# with what the seed derives to. That catches a truncated or corrupted export outright.
+ed25519_public_from_seed_file() {
+    local f="$1"
+    have python3 || return 2
+    python3 - "$f" <<'PY' 2>/dev/null
+import base64, sys
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization as s
+except ImportError:
+    sys.exit(2)
+raw = base64.b64decode(open(sys.argv[1], "rb").read().strip(), validate=False)
+if len(raw) not in (32, 64):
+    sys.exit(3)
+seed = raw[:32]
+pub = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+    s.Encoding.Raw, s.PublicFormat.Raw)
+if len(raw) == 64 and raw[32:] != pub:
+    sys.exit(4)
+print(base64.b64encode(pub).decode())
+PY
+}
+
+plist_public_key() {
+    local plist="$1"
+    [[ -f $plist ]] || return 1
+    /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------- workspace
+#
+# Plaintext lives on a RAM disk and nowhere else. `diskutil erasevolume` on a ram:// device
+# needs no sudo, and the volume cannot survive a reboot — which is the one guarantee a
+# temp directory on an SSD can never give you.
+
+workspace_create() {   # workspace_create [mount] [sectors] [pinned]  -> "<mount>\t<device>"
+    local want="${1:-$KV_MOUNT}" sectors="${2:-$KV_RAMDISK_SECTORS}" pinned="${3:-}"
+    [[ -n $pinned ]] || { [[ -n ${KEYVAULT_MOUNT:-} ]] && pinned=1 || pinned=0; }
+    local name dev=""
+    name="$(basename "$want")"
+    if (( ! KV_NO_RAMDISK )); then
+        dev="$(hdiutil attach -nomount "ram://$sectors" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    if [[ -n $dev ]] && diskutil erasevolume HFS+ "$name" "$dev" >/dev/null 2>&1; then
+        chmod 700 "/Volumes/$name" 2>/dev/null
+        printf '%s\t%s\n' "/Volumes/$name" "$dev"
+        return 0
+    fi
+    [[ -n $dev ]] && hdiutil detach "$dev" >/dev/null 2>&1
+    local tmp
+    if (( pinned )); then
+        # An explicit mount point is honoured on both paths, so a caller that pins one
+        # (the test suite does) always knows where the plaintext is.
+        tmp="$want"
+        rm -rf "$tmp" && mkdir -p "$tmp" || die "cannot create a workspace at $tmp"
+    else
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/$name.XXXXXXXX")" || die "cannot create a workspace"
+    fi
+    chmod 700 "$tmp"
+    info "${C_YELLOW}!${C_RESET} could not create a RAM disk; falling back to $tmp"
+    info "  plaintext will briefly touch this disk. It is removed on close, but not overwritten."
+    printf '%s\t%s\n' "$tmp" ""
+}
+
+workspace_destroy() {
+    local mount="$1" dev="$2"
+    if [[ -n $dev ]]; then
+        hdiutil detach "$dev" >/dev/null 2>&1 || hdiutil detach "$dev" -force >/dev/null 2>&1
+    elif [[ -n $mount && -d $mount ]]; then
+        find "$mount" -type f -exec rm -f {} + 2>/dev/null
+        rm -rf "$mount"
+    fi
+}
+
+# ---------------------------------------------------------------------------- age
+
+age_require() {
+    have age || die "age is not installed — run: brew install age"
+}
+
+age_encrypt() {   # age_encrypt <outfile>   (data on stdin)
+    age_require
+    if [[ -n $KV_IDENTITY ]]; then
+        local recipient
+        recipient="$(age-keygen -y "$KV_IDENTITY" 2>/dev/null)" \
+            || die "cannot read an age identity from $KV_IDENTITY"
+        age --armor --recipient "$recipient" --output "$1"
+    else
+        age --armor --passphrase --output "$1"
+    fi
+}
+
+age_decrypt() {   # age_decrypt <infile>    (plaintext on stdout)
+    age_require
+    if [[ -n $KV_IDENTITY ]]; then
+        age --decrypt --identity "$KV_IDENTITY" "$1"
+    else
+        age --decrypt "$1"
+    fi
+}
+
+# ---------------------------------------------------------------------------- session
+
+session_active() { [[ -f $KV_SESSION ]] && [[ -d $(session_get mount) ]]; }
+session_get()    { jq -r --arg k "$1" '.[$k] // ""' "$KV_SESSION" 2>/dev/null; }
+session_dir()    { printf '%s/vault\n' "$(session_get mount)"; }
+session_manifest(){ printf '%s/vault/manifest.json\n' "$(session_get mount)"; }
+
+session_open() {   # session_open [vault-path] [create]
+    session_active && die "a session is already open (keyvault status). Close or abort it first."
+
+    local src="${1:-$KV_ARTIFACT}" create="${2:-}" mount dev ws
+    # Only a command that is about to write may start from an empty vault. For anything
+    # that reads (verify, list, restore, a grant), a missing artifact is an error: an empty
+    # vault that "verifies" is a backup that lies.
+    [[ -f $src || $create == create ]] || die "no vault at $(tildify "$src") — run 'keyvault pack' first"
+    ws="$(workspace_create)" || exit 1
+    mount="${ws%%$'\t'*}"; dev="${ws##*$'\t'}"
+
+    mkdir -p "$mount/vault/items"
+
+    if [[ -f $src ]]; then
+        step "Opening $(tildify "$src")"
+        if ! age_decrypt "$src" | tar -xzf - -C "$mount"; then
+            workspace_destroy "$mount" "$dev"
+            die "could not decrypt or unpack $src (wrong passphrase?)"
+        fi
+        [[ -f $mount/vault/manifest.json ]] || {
+            workspace_destroy "$mount" "$dev"
+            die "$src decrypted, but holds no manifest.json — not a keyvault artifact"
+        }
+    else
+        step "No vault at $(tildify "$src") — starting an empty one"
+        src=""
+        jq -n --argjson v "$KV_MANIFEST_VERSION" \
+            '{version:$v, packed_at:null, items:[]}' > "$mount/vault/manifest.json"
+    fi
+
+    mkdir -p "$KV_STATE"
+    jq -n --arg m "$mount" --arg d "$dev" --arg s "$src" --arg t "$(now_utc)" \
+        --argjson fb "$([[ -z $dev ]] && echo true || echo false)" \
+        '{mount:$m, device:$d, source:$s, opened_at:$t, fallback:$fb}' > "$KV_SESSION"
+    chmod 600 "$KV_SESSION"
+}
+
+session_close() {   # re-encrypt to the artifact, then tear the workspace down
+    session_active || die "no session is open"
+    local mount dev
+    mount="$(session_get mount)"; dev="$(session_get device)"
+
+    local tmp="$mount/out.age"
+    step "Sealing"
+    if ! tar -czf - -C "$mount" vault | age_encrypt "$tmp"; then
+        die "encryption failed — the session is still open, nothing was lost. Retry, or 'keyvault abort'."
+    fi
+    [[ -s $tmp ]] || die "encryption produced an empty file — refusing to overwrite the artifact"
+
+    mkdir -p "$KV_DEST" "$KV_ARCHIVE"
+    if [[ -f $KV_ARTIFACT ]]; then
+        # Two packs in the same second must not collide — the older one is exactly the
+        # copy you would want back after a bad pack, and overwriting it loses it silently.
+        local base="$KV_ARCHIVE/keyvault-$(stamp)" prev="" n=1
+        prev="$base.age"
+        while [[ -e $prev ]]; do prev="$base-$((++n)).age"; done
+        cp -p "$KV_ARTIFACT" "$prev" || die "could not archive the previous artifact"
+    fi
+    cp "$tmp" "$KV_ARTIFACT.new" && mv -f "$KV_ARTIFACT.new" "$KV_ARTIFACT" \
+        || die "could not write $KV_ARTIFACT"
+    chmod 600 "$KV_ARTIFACT"
+
+    # Keep the last N previous versions; a bad pack is recoverable, an infinite pile is not.
+    local old
+    old="$(ls -t "$KV_ARCHIVE"/keyvault-*.age 2>/dev/null | tail -n +$((KV_ARCHIVE_KEEP + 1)))"
+    [[ -n $old ]] && printf '%s\n' "$old" | while read -r f; do rm -f "$f"; done
+
+    dest_readme_write
+    catalog_write "$(session_manifest)"
+    workspace_destroy "$mount" "$dev"
+    rm -f "$KV_SESSION"
+
+    local size
+    size="$(du -h "$KV_ARTIFACT" | awk '{print $1}')"
+    ok "$(tildify "$KV_ARTIFACT")  ($size)"
+}
+
+session_abort() {
+    session_active || die "no session is open"
+    workspace_destroy "$(session_get mount)" "$(session_get device)"
+    rm -f "$KV_SESSION"
+    ok "session discarded; the artifact on disk is untouched"
+}
+
+# One-shot commands open a session, do their work and close it. If the user opened the
+# session themselves, leave it open — they are mid-edit.
+auto_open() {   # auto_open <save|nosave>
+    if session_active; then
+        return 0
+    fi
+    session_open "$KV_ARTIFACT" "$([[ $1 == save ]] && echo create)"
+    KV_AUTO_OPENED=1
+    [[ $1 == save ]] && KV_AUTO_SAVE=1
+    trap auto_finish EXIT
+}
+
+auto_finish() {
+    local rc=$?     # in the EXIT trap, the status the command is exiting with
+    trap - EXIT
+    (( KV_AUTO_OPENED )) || return 0
+    KV_AUTO_OPENED=0
+    # Reseal only on success. A command that died halfway has left the workspace in a
+    # state nobody asked for; sealing it would replace a good artifact with a broken one.
+    if (( KV_AUTO_SAVE && rc == 0 )); then
+        session_close
+    else
+        (( KV_AUTO_SAVE )) && info "nothing saved — the command failed, so the vault on disk is unchanged"
+        workspace_destroy "$(session_get mount)" "$(session_get device)"
+        rm -f "$KV_SESSION"
+    fi
+}
+
+# ---------------------------------------------------------------------------- manifest
+
+mf_read()  { cat "$(session_manifest)"; }
+mf_write() {   # jq program + args applied to the manifest, written back atomically
+    local m; m="$(session_manifest)"
+    jq "$@" "$m" > "$m.new" && mv -f "$m.new" "$m" || die "could not update the manifest"
+}
+mf_item()  { jq -c --arg id "$1" '.items[] | select(.id == $id)' "$(session_manifest)"; }
+mf_has()   { [[ -n $(mf_item "$1") ]]; }
+
+mf_put() {   # mf_put <json-object>   — replace by id, else append
+    mf_write --argjson it "$1" '.items = ((.items | map(select(.id != $it.id))) + [$it])'
+}
+
+mf_drop() { mf_write --arg id "$1" '.items |= map(select(.id != $id))'; }
+
+item_path() { printf '%s/%s\n' "$(session_dir)" "$1"; }
+item_swap() {   # item_swap <id> <staged-dir> — replace items/<id> with a finished copy
+    local dir; dir="$(item_path "items/$1")"
+    rm -rf "$dir" && mv "$2" "$dir" || die "could not replace item $1"
+}
+
+# ---------------------------------------------------------------------------- the conf DSL
+#
+# keyvault.conf is sourced, so it is plain bash and quoting just works. Each directive
+# appends one source spec; nothing is collected until pack runs.
+
+declare -a KV_SOURCES=()
+
+_spec() { KV_SOURCES+=("$1"); }
+
+sparkle() {
+    local account="$1"; shift
+    local plist="" desc=""
+    while (($#)); do
+        case "$1" in
+            --plist) plist="$2"; shift 2 ;;
+            --desc)  desc="$2";  shift 2 ;;
+            *) die "keyvault.conf: sparkle: unknown option '$1'" ;;
+        esac
+    done
+    _spec "$(jq -nc --arg a "$account" --arg p "$plist" --arg d "$desc" \
+        '{type:"sparkle", account:$a, plist:$p, desc:$d}')"
+}
+
+identities() {
+    local keychain="${1:-login.keychain-db}"; shift || true
+    local desc=""
+    while (($#)); do
+        case "$1" in
+            --desc) desc="$2"; shift 2 ;;
+            *) die "keyvault.conf: identities: unknown option '$1'" ;;
+        esac
+    done
+    _spec "$(jq -nc --arg k "$keychain" --arg d "$desc" \
+        '{type:"identities", keychain:$k, desc:$d}')"
+}
+
+file() {
+    local path="$1"; shift
+    local desc="" id=""
+    while (($#)); do
+        case "$1" in
+            --desc) desc="$2"; shift 2 ;;
+            --id)   id="$2";   shift 2 ;;
+            *) die "keyvault.conf: file: unknown option '$1'" ;;
+        esac
+    done
+    _spec "$(jq -nc --arg p "$path" --arg d "$desc" --arg i "$id" \
+        '{type:"file", path:$p, desc:$d, id:$i}')"
+}
+
+glob() {
+    local dir="$1" pattern="$2"; shift 2
+    local desc=""
+    while (($#)); do
+        case "$1" in
+            --desc) desc="$2"; shift 2 ;;
+            *) die "keyvault.conf: glob: unknown option '$1'" ;;
+        esac
+    done
+    _spec "$(jq -nc --arg dir "$dir" --arg pat "$pattern" --arg d "$desc" \
+        '{type:"glob", dir:$dir, pattern:$pat, desc:$d}')"
+}
+
+# meta <id> key=value …  — facts an agent needs to *use* a key without ever seeing it:
+# the App Store Connect issuer id, which apps it serves, the team. Merged into the
+# manifest at pack time and published, secret-free, in catalog.json.
+declare -a KV_META=()
+
+dest() { :; }   # read by conf_dest at startup; nothing to do when the config loads for real
+
+meta() {
+    local id="$1"; shift
+    local kv obj='{}'
+    for kv in "$@"; do
+        [[ $kv == *=* ]] || die "keyvault.conf: meta $id: expected key=value, got '$kv'"
+        obj="$(jq -c --arg k "${kv%%=*}" --arg v "${kv#*=}" '. + {($k): $v}' <<<"$obj")"
+    done
+    KV_META+=("$(jq -nc --arg id "$id" --argjson m "$obj" '{id:$id, meta:$m}')")
+}
+
+# conf_load [soft] — `soft` reports a bad or empty config instead of exiting, so that
+# validate can still finish its report on a machine whose config has drifted.
+conf_load() {
+    local soft="${1:-}"
+    KV_SOURCES=(); KV_META=()
+    if [[ ! -f $KV_CONF ]]; then
+        [[ $soft == soft ]] && return 1
+        die "no config at $KV_CONF"
+    fi
+    # shellcheck disable=SC1090
+    if ! source "$KV_CONF"; then
+        [[ $soft == soft ]] && return 1
+        die "keyvault.conf failed to load"
+    fi
+    if (( ${#KV_SOURCES[@]} == 0 )); then
+        [[ $soft == soft ]] && return 1
+        die "keyvault.conf declares nothing to collect"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------- metadata
+#
+# What a key *is*, derived from the file itself: kind, key ids, certificate subject and
+# expiry, public-key fingerprints. Everything here is public by construction — this is
+# what lets an agent find "the ASC key for team X" without being able to read it.
+
+pubkey_sha256() {   # base64 SHA-256 of the DER public key — the form GitHub and Apple show
+    openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64
+}
+
+file_meta() {   # file_meta <path>  -> {"kind":…, "meta":{…}}
+    local f="$1" name kind=file m='{}' v
+    name="$(basename "$f")"
+    add_m() { m="$(jq -c --arg k "$1" --arg v "$2" '. + {($k): $v}' <<<"$m")"; }
+
+    if [[ $name =~ AuthKey_([A-Z0-9]{10})\.p8$ ]]; then
+        kind=asc-api-key; add_m asc_key_id "${BASH_REMATCH[1]}"
+    fi
+    case "$name" in *.p12|*.pfx) kind=pkcs12 ;; esac
+
+    if grep -q 'AGE-SECRET-KEY-' "$f" 2>/dev/null; then
+        kind=age-identity
+        v="$(age-keygen -y "$f" 2>/dev/null | paste -sd, -)"
+        [[ -n $v ]] && add_m age_recipient "$v"
+    elif grep -q -- '-----BEGIN CERTIFICATE-----' "$f" 2>/dev/null; then
+        grep -q -- 'PRIVATE KEY-----' "$f" && kind=certificate-and-key || kind=x509-certificate   # gitleaks:allow — a kind name, not a key
+        v="$(openssl x509 -in "$f" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')"
+        [[ -n $v ]] && add_m subject "$v"
+        v="$(openssl x509 -in "$f" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+        [[ -n $v ]] && add_m not_after "$v"
+    elif grep -q -- 'PRIVATE KEY-----' "$f" 2>/dev/null; then
+        [[ $kind == asc-api-key ]] || kind=private-key
+    fi
+    if grep -q -- 'PRIVATE KEY-----' "$f" 2>/dev/null; then
+        v="$(pubkey_sha256 "$f")"
+        [[ -n $v && $v != "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" ]] && add_m public_key_sha256 "$v"
+    fi
+    unset -f add_m
+    jq -nc --arg k "$kind" --argjson m "$m" '{kind:$k, meta:$m}'
+}
+
+cert_not_after() {   # cert_not_after <keychain> <sha1>
+    security find-certificate -a -Z -p "$1" 2>/dev/null \
+        | awk -v want="$2" '/^SHA-1 hash:/ {h=$3} /BEGIN CERTIFICATE/ {if (h==want) p=1} p {print} /END CERTIFICATE/ {if (p) exit}' \
+        | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
+}
+
+# ---------------------------------------------------------------------------- collectors
+
+collect_sparkle() {
+    local spec="$1"
+    local account plist desc id dir out pub derived
+    account="$(jq -r '.account' <<<"$spec")"
+    plist="$(untildify "$(jq -r '.plist' <<<"$spec")")"
+    desc="$(jq -r '.desc' <<<"$spec")"
+    id="sparkle-$account"
+
+    local sb; sb="$(kv_sparkle_bin)" || { bad "$id  Sparkle's tools were not found — build an app that uses Sparkle, or set KEYVAULT_SPARKLE_BIN"; return 1; }
+
+    pub="$("$sb/generate_keys" -p --account "$account" 2>/dev/null)"
+    [[ -n $pub ]] || { bad "$id  no key for account '$account' in the login keychain"; return 1; }
+
+    dir="$(item_path "items/$id")"; mkdir -p "$dir"
+    out="$dir/private-key.txt"
+    rm -f "$out"
+    if ! "$sb/generate_keys" -x "$out" --account "$account" >/dev/null 2>&1 || [[ ! -s $out ]]; then
+        bad "$id  export failed (did you deny the keychain prompt?)"
+        return 1
+    fi
+    chmod 600 "$out"
+
+    derived="$(ed25519_public_from_seed_file "$out")"
+    if [[ -n $derived && $derived != "$pub" ]]; then
+        bad "$id  the exported key derives to $derived but the keychain reports $pub"
+        return 1
+    fi
+
+    mf_put "$(jq -nc \
+        --arg id "$id" --arg account "$account" --arg pub "$pub" --arg desc "$desc" \
+        --arg plist "$(tildify "$plist")" \
+        --arg file "items/$id/private-key.txt" --arg sha "$(sha256_of "$out")" \
+        '{id:$id, type:"sparkle", kind:"sparkle-ed25519", account:$account, public_key:$pub,
+          plist:$plist, file:$file, sha256:$sha, desc:$desc, adhoc:false}')"
+    ok "$id  $pub"
+}
+
+collect_identities() {
+    local spec="$1"
+    local keychain desc id dir out pw
+    keychain="$(jq -r '.keychain' <<<"$spec")"
+    desc="$(jq -r '.desc' <<<"$spec")"
+    id="identities-${keychain%%.*}"
+
+    local listing
+    listing="$(security find-identity -v "$keychain" 2>/dev/null)"
+    [[ -n $listing ]] || { bad "$id  no identities in $keychain"; return 1; }
+
+    # Stock macOS awk has no 3-argument match(), so parse with sed and let jq do the
+    # quoting — certificate common names carry non-ASCII and would break naive escaping.
+    local certs
+    certs="$(sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([0-9A-F]\{40\}\)[[:space:]]*"\(.*\)"$/\1	\2/p' <<<"$listing")"
+    [[ -n $certs ]] || { bad "$id  could not parse 'security find-identity -v $keychain'"; return 1; }
+
+    local certs_json
+    certs_json="$(printf '%s\n' "$certs" | jq -R -s -c \
+        'split("\n") | map(select(length > 0) | split("\t") | {sha1: .[0], name: .[1]}
+          | . + {kind: (.name | split(":")[0]),
+                 team_id: (.name | capture("\\((?<t>[A-Z0-9]{10})\\)$").t? // null)})')" \
+        || { bad "$id  could not encode the certificate list"; return 1; }
+
+    local sha1 end
+    for sha1 in $(jq -r '.[].sha1' <<<"$certs_json"); do
+        end="$(cert_not_after "$keychain" "$sha1")"
+        [[ -n $end ]] && certs_json="$(jq -c --arg s "$sha1" --arg e "$end" \
+            'map(if .sha1 == $s then . + {not_after: $e} else . end)' <<<"$certs_json")"
+    done
+
+    dir="$(item_path "items/$id")"; mkdir -p "$dir"
+    out="$dir/identities.p12"
+    rm -f "$out"
+    pw="$(random_password)"
+
+    info "    macOS will ask permission for each private key — click Allow (or Always Allow)."
+    if ! security export -k "$keychain" -t identities -f pkcs12 -P "$pw" -o "$out" 2>/dev/null || [[ ! -s $out ]]; then
+        bad "$id  'security export' failed or was denied"
+        return 1
+    fi
+    chmod 600 "$out"
+
+    mf_put "$(jq -nc \
+        --arg id "$id" --arg keychain "$keychain" --arg pw "$pw" --arg desc "$desc" \
+        --arg file "items/$id/identities.p12" --arg sha "$(sha256_of "$out")" \
+        --argjson certs "$certs_json" \
+        '{id:$id, type:"identities", kind:"codesign-identities", keychain:$keychain, p12_password:$pw, certs:$certs,
+          file:$file, sha256:$sha, desc:$desc, adhoc:false}')"
+    ok "$id  $(jq -r 'length' <<<"$certs_json") certificates"
+}
+
+# The destination folder can legitimately hold keys too (it does here), so a source glob
+# may point straight at it. Never collect keyvault's own output: a vault holding a copy of
+# itself doubles every pack, and the catalog is regenerated anyway. Compare canonicalized
+# on both sides — $KV_DEST may sit under a symlinked parent that resolve_path collapsed.
+is_own_output() {   # is_own_output <resolved-path>
+    local path="$1" c_archive c_dest
+    c_archive="$(cd "$KV_ARCHIVE" 2>/dev/null && pwd -P)"
+    c_dest="$(cd "$KV_DEST" 2>/dev/null && pwd -P)"
+    [[ $path == "$(resolve_path "$KV_ARTIFACT")" ]] && return 0
+    [[ -n $c_archive && $path == "$c_archive"/* ]] && return 0
+    case "$path" in
+        "$c_dest/README.txt"|"$c_dest/catalog.json"|"$c_dest/catalog.json.new"|"$c_dest/keyvault.age.new") [[ -n $c_dest ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Every file a glob spec matches right now, resolved — the same set collect_glob packs.
+glob_matches() {   # glob_matches <spec>
+    local dir pattern f p
+    dir="$(untildify "$(jq -r '.dir' <<<"$1")")"; pattern="$(jq -r '.pattern' <<<"$1")"
+    [[ -d $dir ]] || return 0
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        p="$(resolve_path "$f")"
+        is_own_output "$p" || printf '%s\n' "$p"
+    done < <(find -L "$dir" -maxdepth 1 -type f -name "$pattern" 2>/dev/null | sort)
+}
+
+collect_file() {   # collect_file <path> <desc> [id] [adhoc]
+    local given="$1" desc="$2" id="${3:-}" adhoc="${4:-false}"
+    [[ -e $given ]] || { bad "${id:-$given}  no such file"; return 1; }
+
+    # Store the real bytes under the real path; remember the link so restore rebuilds both.
+    # Only a genuine symlink counts: resolve_path also canonicalizes a symlinked *parent*
+    # (/var -> /private/var), and recording that as a link would invent one that never was.
+    local path link=""
+    path="$(resolve_path "$given")"
+    [[ -L $given ]] && link="$given"
+    [[ -f $path ]] || { bad "${id:-$given}  is not a regular file (broken symlink?)"; return 1; }
+
+    if is_own_output "$path"; then
+        note "skipping $(tildify "$path") — that is keyvault's own output"
+        return 0
+    fi
+
+    [[ -n $id ]] || id="$(basename "$path" | tr ' ' '_')"
+
+    # Ids come from basenames, and key bundles are full of cert.pem / key.pem. Two
+    # different files landing on one id would mean the vault silently holds one of them
+    # twice and the other not at all — the worst thing a backup can do quietly.
+    local existing other
+    existing="$(mf_item "$id")"
+    if [[ -n $existing ]]; then
+        other="$(jq -r '.path // ""' <<<"$existing")"
+        if [[ -n $other && $other != "$(tildify "$path")" ]]; then
+            bad "$id  claimed by two files: $(tildify "$other")"
+            bad "$(printf '%*s' ${#id} '')  and $(tildify "$path") — give one an --id in keyvault.conf"
+            return 1
+        fi
+    fi
+
+    local dir out
+    dir="$(item_path "items/$id")"; mkdir -p "$dir"
+    out="$dir/$(basename "$path")"
+    cp -p "$path" "$out" || { bad "$id  copy failed"; return 1; }
+    chmod 600 "$out"
+
+    mf_put "$(jq -nc \
+        --arg id "$id" --arg path "$(tildify "$path")" --arg mode "$(file_mode "$path")" \
+        --arg link "$([[ -n $link ]] && tildify "$link")" \
+        --arg file "items/$id/$(basename "$path")" --arg sha "$(sha256_of "$path")" \
+        --arg desc "$desc" --argjson adhoc "$adhoc" --argjson fm "$(file_meta "$path")" \
+        '{id:$id, type:"file", kind:$fm.kind, path:$path, mode:$mode,
+          link:(if $link == "" then null else $link end),
+          file:$file, sha256:$sha, desc:$desc, meta:$fm.meta, adhoc:$adhoc}')"
+    if [[ -n $link ]]; then
+        ok "$id  $(tildify "$path")  $(dim "(via $(tildify "$link"))")"
+    else
+        ok "$id  $(tildify "$path")"
+    fi
+}
+
+collect_glob() {
+    local spec="$1" dir pattern desc n=0 rc=0
+    dir="$(untildify "$(jq -r '.dir' <<<"$spec")")"
+    pattern="$(jq -r '.pattern' <<<"$spec")"
+    desc="$(jq -r '.desc' <<<"$spec")"
+    [[ -d $dir ]] || { warn "glob $(tildify "$dir")  directory does not exist — skipped"; return 0; }
+    local f
+    # A file that fails here must fail the pack. Swallowing it would mean a key silently
+    # absent from a vault that reported success — which is how a backup lies to you.
+    # The loop runs in this shell (not a pipeline subshell) so rc survives.
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        if collect_file "$f" "$desc" "" false; then n=$((n + 1)); else rc=1; fi
+    done < <(find -L "$dir" -maxdepth 1 -type f -name "$pattern" 2>/dev/null | sort)
+    (( n )) || warn "glob $(tildify "$dir")/$pattern  matched nothing"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------- pack
+
+cmd_pack() {
+    local fresh=0
+    while (($#)); do
+        case "$1" in
+            --fresh) fresh=1; shift ;;
+            --identity) KV_IDENTITY="$2"; shift 2 ;;
+            *) die "pack: unknown option '$1'" ;;
+        esac
+    done
+
+    have jq || die "jq is not installed — run: brew install jq"
+    age_require
+    conf_load
+
+    local reopened=0
+    if session_active; then
+        reopened=1
+    else
+        session_open "$KV_ARTIFACT" create
+        KV_AUTO_OPENED=1; KV_AUTO_SAVE=0
+        trap auto_finish EXIT
+    fi
+
+    # Everything added by hand survives a repack; conf-declared items are re-collected fresh.
+    if (( fresh )); then
+        mf_write '.items = []'
+        step "Collecting (--fresh: ad-hoc items dropped)"
+    else
+        mf_write '.items |= map(select(.adhoc == true))'
+        local kept; kept="$(jq -r '.items | length' "$(session_manifest)")"
+        step "Collecting$( (( kept )) && printf ' (carrying %s ad-hoc item%s)' "$kept" "$( ((kept>1)) && echo s)" )"
+    fi
+
+    local spec type failed=0
+    for spec in "${KV_SOURCES[@]}"; do
+        type="$(jq -r '.type' <<<"$spec")"
+        case "$type" in
+            sparkle)    collect_sparkle "$spec"    || failed=1 ;;
+            identities) collect_identities "$spec" || failed=1 ;;
+            file)       collect_file "$(untildify "$(jq -r '.path' <<<"$spec")")" \
+                                     "$(jq -r '.desc' <<<"$spec")" \
+                                     "$(jq -r '.id'   <<<"$spec")" false || failed=1 ;;
+            glob)       collect_glob "$spec"      || failed=1 ;;
+            *) die "keyvault.conf: unknown source type '$type'" ;;
+        esac
+    done
+
+    local m mid
+    for m in ${KV_META[@]+"${KV_META[@]}"}; do
+        mid="$(jq -r '.id' <<<"$m")"
+        if mf_has "$mid"; then
+            mf_write --arg id "$mid" --argjson m "$(jq -c '.meta' <<<"$m")" \
+                '.items |= map(if .id == $id then .meta = ((.meta // {}) + $m) else . end)'
+        else
+            warn "meta $mid  no such item — check the id with 'keyvault catalog'"
+        fi
+    done
+
+    # Drop item directories no longer referenced by the manifest.
+    local d keep
+    keep="$(jq -r '.items[].file' "$(session_manifest)" | sed 's#/[^/]*$##' | sort -u)"
+    while IFS= read -r d; do
+        [[ -n $d ]] || continue
+        grep -qxF "items/$(basename "$d")" <<<"$keep" || rm -rf "$d"
+    done < <(find "$(session_dir)/items" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+
+    mf_write --arg t "$(now_utc)" --arg by "$(whoami)@$(hostname -s)" --arg v "$KV_VERSION" \
+        '.packed_at = $t | .packed_by = $by | .tool_version = $v'
+
+    if (( failed )); then
+        info ""
+        info "${C_YELLOW}Some sources failed.${C_RESET} The session is still open with what did collect."
+        info "Fix the problem and re-run 'keyvault pack', or seal what you have with 'keyvault close'."
+        trap - EXIT
+        KV_AUTO_OPENED=0
+        return 1
+    fi
+
+    trap - EXIT
+    KV_AUTO_OPENED=0
+    if (( reopened )); then
+        info ""
+        note "session left open (you opened it) — run 'keyvault close' to seal"
+        return 0
+    fi
+
+    session_close
+    passphrase_reminder
+}
+
+passphrase_reminder() {
+    [[ -n $KV_IDENTITY ]] && return 0
+    info ""
+    info "${C_BOLD}The passphrase is now the only thing between you and this artifact.${C_RESET}"
+    info "Put it in your password manager ${C_BOLD}and${C_RESET} on paper. There is no recovery path."
+    info "Run 'keyvault card' for a printable recovery sheet."
+}
+
+# ---------------------------------------------------------------------------- list
+
+cmd_list() {
+    have jq || die "jq is not installed"
+    auto_open nosave
+
+    local packed
+    packed="$(jq -r '.packed_at // "never"' "$(session_manifest)")"
+    say "${C_BOLD}$(tildify "$KV_ARTIFACT")${C_RESET}"
+    say "$(dim "packed $packed by $(jq -r '.packed_by // "?"' "$(session_manifest)")")"
+    say ""
+
+    local n; n="$(jq -r '.items | length' "$(session_manifest)")"
+    if [[ $n == 0 ]]; then
+        note "empty"
+        return 0
+    fi
+
+    printf '%-28s %-11s %-5s %s\n' "ID" "TYPE" "ADHOC" "DETAIL"
+    printf '%s\n' "$(dim "$(printf '%.0s─' {1..78})")"
+    local it
+    while IFS= read -r it; do
+        local id type adhoc detail
+        id="$(jq -r '.id' <<<"$it")"
+        type="$(jq -r '.type' <<<"$it")"
+        adhoc="$(jq -r 'if .adhoc then "yes" else "-" end' <<<"$it")"
+        case "$type" in
+            sparkle)    detail="$(jq -r '.public_key' <<<"$it")" ;;
+            identities) detail="$(jq -r '"\(.certs | length) certificates"' <<<"$it")" ;;
+            file)       detail="$(jq -r '.path' <<<"$it")" ;;
+            secret)     detail="$(jq -r '.desc // "(secret)"' <<<"$it")" ;;
+            *)          detail="" ;;
+        esac
+        printf '%-28s %-11s %-5s %s\n' "$id" "$type" "$adhoc" "$detail"
+    done < <(jq -c '.items[]' "$(session_manifest)")
+}
+
+# ---------------------------------------------------------------------------- add / remove
+
+cmd_add() {
+    (($#)) || die "usage: keyvault add <id> --file PATH | --secret | --stdin  [--desc TEXT] [--restore-to PATH]"
+    local id="$1"; shift
+    local src="" mode="" desc="" restore_to="" extra='{}'
+    while (($#)); do
+        case "$1" in
+            --file)       mode=file;   src="$2"; shift 2 ;;
+            --secret)     mode=secret; shift ;;
+            --stdin)      mode=stdin;  shift ;;
+            --desc)       desc="$2";       shift 2 ;;
+            --restore-to) restore_to="$2"; shift 2 ;;
+            --meta)       [[ $2 == *=* ]] || die "add: --meta wants key=value"
+                          extra="$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '. + {($k): $v}' <<<"$extra")"
+                          shift 2 ;;
+            *) die "add: unknown option '$1'" ;;
+        esac
+    done
+    [[ -n $mode ]] || die "add: one of --file PATH, --secret or --stdin is required"
+    [[ $id =~ ^[A-Za-z0-9._-]+$ ]] || die "add: id must be [A-Za-z0-9._-]"
+
+    have jq || die "jq is not installed"
+    auto_open save
+
+    case "$mode" in
+        file)
+            src="$(untildify "$src")"
+            [[ -f $src ]] || die "add: no such file: $src"
+            [[ -n $restore_to ]] || restore_to="$src"
+            local new; new="$(item_path "items/.$id.new")"; rm -rf "$new"; mkdir -p "$new"
+            cp -p "$src" "$new/$(basename "$src")" || { rm -rf "$new"; die "add: copy failed"; }
+            chmod 600 "$new/$(basename "$src")"
+            item_swap "$id" "$new"
+            mf_put "$(jq -nc \
+                --arg id "$id" --arg path "$(tildify "$restore_to")" --arg mode "$(file_mode "$src")" \
+                --arg file "items/$id/$(basename "$src")" --arg sha "$(sha256_of "$src")" \
+                --arg desc "$desc" --argjson fm "$(file_meta "$src")" --argjson x "$extra" \
+                '{id:$id, type:"file", kind:$fm.kind, path:$path, mode:$mode, file:$file,
+                  sha256:$sha, desc:$desc, meta:($fm.meta + $x), adhoc:true}')"
+            ok "$id  <- $(tildify "$src")"
+            ;;
+        secret|stdin)
+            # Built beside the old item and swapped in only once it is complete: a
+            # replacement that fails halfway must leave the old one exactly as it was.
+            local new out; new="$(item_path "items/.$id.new")"; rm -rf "$new"; mkdir -p "$new"
+            out="$new/secret"
+            if [[ $mode == secret ]]; then
+                local v1 v2
+                printf 'Secret for %s (not echoed): ' "$id" >&2; IFS= read -rs v1 </dev/tty; printf '\n' >&2
+                printf 'Again: ' >&2;                            IFS= read -rs v2 </dev/tty; printf '\n' >&2
+                [[ $v1 == "$v2" ]] || { rm -rf "$new"; die "add: the two entries differ"; }
+                [[ -n $v1 ]] || { rm -rf "$new"; die "add: empty secret"; }
+                printf '%s' "$v1" > "$out"
+            else
+                cat > "$out"
+                [[ -s $out ]] || { rm -rf "$new"; die "add: nothing arrived on stdin"; }
+            fi
+            chmod 600 "$out"
+            item_swap "$id" "$new"; out="$(item_path "items/$id/secret")"
+            mf_put "$(jq -nc \
+                --arg id "$id" --arg file "items/$id/secret" --arg sha "$(sha256_of "$out")" \
+                --arg desc "$desc" --arg to "$(tildify "${restore_to:-}")" --argjson x "$extra" \
+                '{id:$id, type:"secret", kind:"secret", meta:$x, file:$file, sha256:$sha, desc:$desc,
+                  path:(if $to == "" then null else $to end), adhoc:true}')"
+            ok "$id  stored ($(wc -c <"$out" | tr -d ' ') bytes)"
+            ;;
+    esac
+}
+
+cmd_remove() {
+    (($#)) || die "usage: keyvault remove <id>"
+    local id="$1"
+    have jq || die "jq is not installed"
+    auto_open save
+    mf_has "$id" || die "remove: no item with id '$id' (keyvault list)"
+    rm -rf "$(item_path "items/$id")"
+    mf_drop "$id"
+    ok "$id  removed"
+}
+
+# ---------------------------------------------------------------------------- show
+
+cmd_show() {
+    (($#)) || die "usage: keyvault show <id> [--out PATH | --stdout]"
+    local id="$1"; shift
+    local out="" to_stdout=0
+    while (($#)); do
+        case "$1" in
+            --out)    out="$2"; shift 2 ;;
+            --stdout) to_stdout=1; shift ;;
+            *) die "show: unknown option '$1'" ;;
+        esac
+    done
+    have jq || die "jq is not installed"
+    auto_open nosave
+    local it; it="$(mf_item "$id")"
+    [[ -n $it ]] || die "show: no item with id '$id'"
+    local src; src="$(session_dir)/$(jq -r '.file' <<<"$it")"
+
+    if (( to_stdout )); then
+        [[ -t 1 ]] && info "${C_YELLOW}!${C_RESET} writing a secret to your terminal scrollback."
+        cat "$src"
+    elif [[ -n $out ]]; then
+        out="$(untildify "$out")"
+        [[ -e $out ]] && die "show: $out already exists"
+        ( umask 077 && cp "$src" "$out" ) || die "show: could not write $out"
+        ok "$id -> $(tildify "$out")"
+    else
+        die "show: pass --out PATH (safe) or --stdout (goes into your scrollback)"
+    fi
+}
+
+# ---------------------------------------------------------------------------- verify
+#
+# Offline: does the vault hold what its manifest says it holds? No keychain, no prompts,
+# no network. This is the check you run on a *different* machine to answer "is my backup
+# actually good", which is the only question that matters before you need it.
+
+cmd_verify() {
+    have jq || die "jq is not installed"
+    auto_open nosave
+    step "Verifying $(tildify "$(session_get source)" 2>/dev/null || echo "$KV_ARTIFACT")"
+
+    local rc=0 it
+    while IFS= read -r it; do
+        local id type file sha actual
+        id="$(jq -r '.id' <<<"$it")"; type="$(jq -r '.type' <<<"$it")"
+        file="$(jq -r '.file' <<<"$it")"; sha="$(jq -r '.sha256' <<<"$it")"
+        local full="$(session_dir)/$file"
+
+        if [[ ! -f $full ]]; then
+            bad "$id  the manifest names $file, which is not in the vault"; rc=1; continue
+        fi
+        actual="$(sha256_of "$full")"
+        if [[ $actual != "$sha" ]]; then
+            bad "$id  checksum mismatch (stored $sha, actual $actual)"; rc=1; continue
+        fi
+
+        case "$type" in
+            sparkle)
+                local recorded derived st
+                recorded="$(jq -r '.public_key' <<<"$it")"
+                derived="$(ed25519_public_from_seed_file "$full")"; st=$?
+                if (( st == 2 )); then
+                    warn "$id  checksum ok; cannot derive the public key (python3 'cryptography' missing)"
+                elif (( st != 0 )) || [[ -z $derived ]]; then
+                    bad "$id  the stored private key is not a valid ed25519 key"; rc=1
+                elif [[ $derived != "$recorded" ]]; then
+                    bad "$id  stored key derives to $derived, manifest claims $recorded"; rc=1
+                else
+                    ok "$id  private key derives to $recorded"
+                fi
+                ;;
+            identities)
+                local pw n
+                pw="$(jq -r '.p12_password' <<<"$it")"
+                n="$(openssl pkcs12 -in "$full" -nokeys -passin "pass:$pw" -legacy 2>/dev/null \
+                        | grep -c 'BEGIN CERTIFICATE')"
+                [[ $n == 0 ]] && n="$(openssl pkcs12 -in "$full" -nokeys -passin "pass:$pw" 2>/dev/null \
+                        | grep -c 'BEGIN CERTIFICATE')"
+                local claimed; claimed="$(jq -r '.certs | length' <<<"$it")"
+                if [[ $n == 0 ]]; then
+                    warn "$id  checksum ok; openssl could not open the .p12 to count certificates"
+                elif [[ $n != "$claimed" ]]; then
+                    bad "$id  manifest claims $claimed certificates, the .p12 holds $n"; rc=1
+                else
+                    ok "$id  .p12 opens with the stored password, $n certificates"
+                fi
+                ;;
+            *)
+                ok "$id  checksum ok ($(wc -c <"$full" | tr -d ' ') bytes)"
+                ;;
+        esac
+    done < <(jq -c '.items[]' "$(session_manifest)")
+
+    say ""
+    (( rc )) && bad "the vault is NOT sound — see above" || ok "the vault is internally sound"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------- validate
+#
+# Does the vault still describe *this machine*? Answers the two questions a backup can
+# get wrong: something on the machine changed and the vault is stale, or the vault holds
+# a key that no longer signs what it is supposed to sign.
+
+cmd_validate() {
+    have jq || die "jq is not installed"
+    auto_open nosave
+    step "Validating against this machine"
+
+    local rc=0 stale=0 it
+    while IFS= read -r it; do
+        local id type; id="$(jq -r '.id' <<<"$it")"; type="$(jq -r '.type' <<<"$it")"
+        local full; full="$(session_dir)/$(jq -r '.file' <<<"$it")"
+
+        case "$type" in
+            sparkle)
+                local account recorded derived live plist shipped
+                account="$(jq -r '.account' <<<"$it")"
+                recorded="$(jq -r '.public_key' <<<"$it")"
+                plist="$(untildify "$(jq -r '.plist // ""' <<<"$it")")"
+                derived="$(ed25519_public_from_seed_file "$full")"
+
+                if [[ -n $derived && $derived != "$recorded" ]]; then
+                    bad "$id  the stored key derives to $derived, not the recorded $recorded"; rc=1; continue
+                fi
+
+                local sb; sb="$(kv_sparkle_bin)"
+                if [[ -n $sb ]]; then
+                    live="$("$sb/generate_keys" -p --account "$account" 2>/dev/null)"
+                    if [[ -z $live ]]; then
+                        warn "$id  no key for '$account' in this keychain — the vault is your only copy"
+                    elif [[ $live != "$recorded" ]]; then
+                        bad "$id  keychain now holds $live, the vault holds $recorded — run 'keyvault pack'"; rc=1; stale=1; continue
+                    else
+                        ok "$id  matches the login keychain"
+                    fi
+                else
+                    note "$id  Sparkle's tools not found; skipped the keychain comparison"
+                fi
+
+                if [[ -n $plist ]]; then
+                    shipped="$(plist_public_key "$plist")"
+                    if [[ -z $shipped ]]; then
+                        warn "$id  no SUPublicEDKey in $(tildify "$plist")"
+                    elif [[ $shipped != "$recorded" ]]; then
+                        bad "$id  $(tildify "$plist") ships $shipped"
+                        bad "$(printf '%*s' ${#id} '')  but this key is $recorded — installed copies would reject its updates"
+                        rc=1
+                    else
+                        ok "$id  signs updates the shipped Info.plist accepts"
+                    fi
+                fi
+                ;;
+
+            identities)
+                local keychain vault_sha1 live_sha1 missing extra
+                keychain="$(jq -r '.keychain' <<<"$it")"
+                vault_sha1="$(jq -r '.certs[].sha1' <<<"$it" | sort)"
+                live_sha1="$(security find-identity -v "$keychain" 2>/dev/null \
+                    | sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([0-9A-F]\{40\}\).*/\1/p' | sort)"
+                missing="$(comm -23 <(printf '%s\n' "$vault_sha1") <(printf '%s\n' "$live_sha1"))"
+                extra="$(comm -13 <(printf '%s\n' "$vault_sha1") <(printf '%s\n' "$live_sha1"))"
+
+                local nv; nv="$(grep -c . <<<"$vault_sha1")"
+                if [[ -z $missing && -z $extra ]]; then
+                    ok "$id  all $nv certificates still in $keychain"
+                else
+                    [[ -n $missing ]] && {
+                        warn "$id  in the vault but no longer in $keychain (restorable):"
+                        local s; while IFS= read -r s; do [[ -n $s ]] || continue
+                            note "    $(jq -r --arg s "$s" '.certs[] | select(.sha1==$s) | .name' <<<"$it")"
+                        done <<<"$missing"
+                    }
+                    [[ -n $extra ]] && {
+                        warn "$id  in $keychain but NOT in the vault — run 'keyvault pack':"
+                        local s; while IFS= read -r s; do [[ -n $s ]] || continue
+                            note "    $(security find-identity -v "$keychain" | grep "$s" | sed 's/.*"\(.*\)"/\1/')"
+                        done <<<"$extra"
+                        stale=1
+                    }
+                fi
+                ;;
+
+            file)
+                local path disk
+                path="$(untildify "$(jq -r '.path' <<<"$it")")"
+                if [[ ! -f $path ]]; then
+                    warn "$id  $(tildify "$path") is gone from disk — the vault is your only copy"
+                else
+                    disk="$(sha256_of "$path")"
+                    if [[ $disk == "$(jq -r '.sha256' <<<"$it")" ]]; then
+                        ok "$id  identical to $(tildify "$path")"
+                    else
+                        warn "$id  $(tildify "$path") differs from the vault copy — run 'keyvault pack'"
+                        stale=1
+                    fi
+                fi
+                ;;
+
+            secret)
+                ok "$id  present ($(jq -r '.desc // "no description"' <<<"$it"))"
+                ;;
+        esac
+    done < <(jq -c '.items[]' "$(session_manifest)")
+
+    # Anything the conf declares that never made it into the vault at all.
+    if conf_load soft && (( ${#KV_SOURCES[@]} > 0 )); then
+        local spec want
+        for spec in "${KV_SOURCES[@]}"; do
+            [[ -n $spec ]] || continue
+            case "$(jq -r '.type' <<<"$spec")" in
+                sparkle) want="sparkle-$(jq -r '.account' <<<"$spec")" ;;
+                identities) want="identities-$(jq -r '.keychain' <<<"$spec" | cut -d. -f1)" ;;
+                file|glob)
+                    # Files are matched by where they live, not by id: a new key dropped into
+                    # a globbed folder has no id until the next pack gives it one.
+                    local p paths
+                    if [[ $(jq -r '.type' <<<"$spec") == file ]]; then
+                        p="$(untildify "$(jq -r '.path' <<<"$spec")")"
+                        [[ -e $p ]] || continue          # gone: reported above as the vault's only copy
+                        paths="$(resolve_path "$p")"
+                    else
+                        paths="$(glob_matches "$spec")"
+                    fi
+                    while IFS= read -r p; do
+                        [[ -n $p ]] || continue
+                        jq -e --arg p "$(tildify "$p")" 'any(.items[]; .path == $p)' "$(session_manifest)" >/dev/null \
+                            || { warn "$(tildify "$p")  matches keyvault.conf but is not in the vault — run 'keyvault pack'"; stale=1; }
+                    done <<<"$paths"
+                    continue ;;
+                *) continue ;;
+            esac
+            mf_has "$want" || { warn "$want  declared in keyvault.conf but not in the vault"; stale=1; }
+        done
+    fi
+
+    say ""
+    if (( rc )); then
+        bad "validation failed"
+    elif (( stale )); then
+        warn "the vault is sound but out of date — run 'keyvault pack'"
+        return 2        # distinct from 1 (broken), so a scheduled check can tell them apart
+    else
+        ok "the vault matches this machine"
+    fi
+    return $rc
+}
+
+# ---------------------------------------------------------------------------- restore
+
+cmd_restore() {
+    local apply=0 only="" force=0
+    while (($#)); do
+        case "$1" in
+            --apply)   apply=1; shift ;;
+            --dry-run) apply=0; shift ;;
+            --only)    only="$2"; shift 2 ;;
+            --force)   force=1; shift ;;
+            --vault)   KV_RESTORE_SRC="$2"; shift 2 ;;
+            --identity) KV_IDENTITY="$2"; shift 2 ;;
+            *) die "restore: unknown option '$1'" ;;
+        esac
+    done
+    have jq || die "jq is not installed"
+
+    if ! session_active; then
+        session_open "${KV_RESTORE_SRC:-$KV_ARTIFACT}"
+        KV_AUTO_OPENED=1; KV_AUTO_SAVE=0
+        trap auto_finish EXIT
+    fi
+
+    if (( apply )); then
+        step "Restoring — this WILL write to disk and to your login keychain"
+    else
+        step "Restoring (dry run — nothing will be changed)"
+    fi
+
+    act() { if (( apply )); then printf '  '; else printf '  %swould%s ' "$C_DIM" "$C_RESET"; fi; }
+
+    local rc=0 it
+    while IFS= read -r it; do
+        local id type; id="$(jq -r '.id' <<<"$it")"; type="$(jq -r '.type' <<<"$it")"
+        [[ -n $only && $only != "$id" ]] && continue
+        local full; full="$(session_dir)/$(jq -r '.file' <<<"$it")"
+
+        case "$type" in
+            sparkle)
+                local account; account="$(jq -r '.account' <<<"$it")"
+                local sb; sb="$(kv_sparkle_bin)"
+                if [[ -z $sb ]]; then
+                    bad "$id  Sparkle's generate_keys not found; set KEYVAULT_SPARKLE_BIN"; rc=1; continue
+                fi
+                local existing; existing="$("$sb/generate_keys" -p --account "$account" 2>/dev/null)"
+                if [[ -n $existing && $existing != "$(jq -r '.public_key' <<<"$it")" ]] && (( ! force )); then
+                    bad "$id  keychain already holds a DIFFERENT key for '$account' ($existing) — pass --force to overwrite"
+                    rc=1; continue
+                fi
+                say "$(act)import the ed25519 key into the login keychain as account '$account'"
+                if (( apply )); then
+                    "$sb/generate_keys" -f "$full" --account "$account" >/dev/null 2>&1 \
+                        && ok "$id  imported" || { bad "$id  import failed"; rc=1; }
+                fi
+                ;;
+
+            identities)
+                local pw keychain
+                pw="$(jq -r '.p12_password' <<<"$it")"
+                keychain="$HOME/Library/Keychains/$(jq -r '.keychain' <<<"$it")"
+                say "$(act)import $(jq -r '.certs | length' <<<"$it") identities into $(tildify "$keychain")"
+                if (( apply )); then
+                    local out
+                    out="$(security import "$full" -k "$keychain" -P "$pw" \
+                            -T /usr/bin/codesign -T /usr/bin/security \
+                            -T /usr/bin/productsign -T /usr/bin/productbuild 2>&1)"
+                    if [[ $? -eq 0 ]]; then
+                        ok "$id  imported"
+                    elif grep -qi 'already exist' <<<"$out"; then
+                        ok "$id  already present"
+                    else
+                        bad "$id  $out"; rc=1
+                    fi
+                fi
+                ;;
+
+            file)
+                local path mode link
+                path="$(untildify "$(jq -r '.path' <<<"$it")")"
+                mode="$(jq -r '.mode // "600"' <<<"$it")"
+                link="$(jq -r '.link // ""' <<<"$it")"
+                [[ -n $link ]] && link="$(untildify "$link")"
+
+                local skip=0
+                if [[ -f $path ]]; then
+                    if [[ "$(sha256_of "$path")" == "$(jq -r '.sha256' <<<"$it")" ]]; then
+                        note "$id  $(tildify "$path") is already identical"
+                        skip=1
+                    elif (( ! force )); then
+                        bad "$id  $(tildify "$path") exists with DIFFERENT contents — pass --force to overwrite"
+                        rc=1; continue
+                    fi
+                fi
+                if (( ! skip )); then
+                    say "$(act)write $(tildify "$path") (mode $mode)"
+                    if (( apply )); then
+                        mkdir -p "$(dirname "$path")" \
+                            && ( umask 077 && cp "$full" "$path" ) \
+                            && chmod "$mode" "$path" \
+                            && ok "$id  written" || { bad "$id  write failed"; rc=1; }
+                    fi
+                fi
+                # The tool that reads this key looks for it at the link, not the real path.
+                if [[ -n $link && ! -e $link ]]; then
+                    say "$(act)link $(tildify "$link") -> $(tildify "$path")"
+                    if (( apply )); then
+                        mkdir -p "$(dirname "$link")" && ln -s "$path" "$link" \
+                            && ok "$id  linked" || { bad "$id  could not create the symlink"; rc=1; }
+                    fi
+                fi
+                ;;
+
+            secret)
+                local path; path="$(jq -r '.path // ""' <<<"$it")"
+                if [[ -n $path ]]; then
+                    path="$(untildify "$path")"
+                    say "$(act)write the secret to $(tildify "$path") (mode 600)"
+                    if (( apply )); then
+                        mkdir -p "$(dirname "$path")" && ( umask 077 && cp "$full" "$path" ) \
+                            && ok "$id  written" || { bad "$id  write failed"; rc=1; }
+                    fi
+                else
+                    note "$id  secret with no restore path — read it with: keyvault show $id --out FILE"
+                fi
+                ;;
+        esac
+    done < <(jq -c '.items[]' "$(session_manifest)")
+
+    say ""
+    if (( apply )); then
+        (( rc )) && bad "restore finished with errors" || ok "restore complete"
+    else
+        note "nothing was changed. Re-run with --apply to do it for real."
+    fi
+    return $rc
+}
+
+# ---------------------------------------------------------------------------- card
+
+cmd_card() {
+    have jq || die "jq is not installed"
+    auto_open nosave
+    local m; m="$(session_manifest)"
+
+    cat <<EOF
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  KEYVAULT RECOVERY SHEET                                                     │
+│  Print this. Keep it with the passphrase, somewhere the house key is not.     │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Artifact   $(tildify "$KV_ARTIFACT")
+  Packed     $(jq -r '.packed_at // "never"' "$m")  by $(jq -r '.packed_by // "?"' "$m")
+  Format     age (armored) -> tar.gz -> vault/{manifest.json, items/…}
+
+  TO OPEN IT WITH NO TOOLS BUT age:
+
+      age --decrypt keyvault.age | tar -xzv
+      cat vault/manifest.json
+
+  WHAT IS INSIDE
+
+$(jq -r '.items[] | "      \(.id)\n          \(.desc // "—")"' "$m")
+
+  PUBLIC KEYS (not secret — use these to check a restored key is the right one)
+
+$(jq -r '.items[] | select(.type=="sparkle") | "      \(.account)\n          \(.public_key)"' "$m")
+
+  IF YOU HAVE LOST THE PASSPHRASE
+      Nothing here is recoverable. Re-issue what can be re-issued (Apple certificates
+      via developer.apple.com, App Store Connect keys via appstoreconnect.apple.com).
+      A lost Sparkle key cannot be re-issued: every installed copy of that app must be
+      replaced by hand. Mint a new key, ship it in a new build, and tell users.
+EOF
+}
+
+# ---------------------------------------------------------------------------- status / doctor
+
+cmd_status() {
+    if session_active; then
+        local opened age_min
+        opened="$(session_get opened_at)"
+        say "${C_YELLOW}session OPEN${C_RESET}"
+        say "  mount    $(session_get mount)$([[ $(session_get fallback) == true ]] && echo "  ${C_YELLOW}(on disk, not a RAM disk)${C_RESET}")"
+        say "  from     $(tildify "$(session_get source)")"
+        say "  since    $opened"
+        say ""
+        say "  Plaintext keys are readable right now. Run 'keyvault close' to seal,"
+        say "  or 'keyvault abort' to discard changes."
+    else
+        say "${C_GREEN}sealed${C_RESET} — no plaintext is mounted"
+    fi
+    say ""
+    if [[ -f $KV_ARTIFACT ]]; then
+        say "  artifact $(tildify "$KV_ARTIFACT")  ($(du -h "$KV_ARTIFACT" | awk '{print $1}'), modified $(date -r "$KV_ARTIFACT" '+%Y-%m-%d %H:%M'))"
+        local n; n="$(ls "$KV_ARCHIVE"/keyvault-*.age 2>/dev/null | wc -l | tr -d ' ')"
+        [[ $n -gt 0 ]] && say "  archive  $n previous version$([[ $n -gt 1 ]] && echo s) in $(tildify "$KV_ARCHIVE")"
+    else
+        say "  artifact ${C_YELLOW}none yet${C_RESET} — run 'keyvault pack'"
+    fi
+    return 0
+}
+
+cmd_doctor() {
+    step "Environment"
+    for t in age jq shasum security openssl python3; do
+        if have "$t"; then ok "$t  $(command -v "$t")"; else bad "$t  missing"; fi
+    done
+    if python3 -c 'import cryptography' 2>/dev/null; then
+        ok "python3 cryptography  (offline ed25519 verification available)"
+    else
+        warn "python3 cryptography missing — 'verify' cannot derive public keys"
+        note "    pip3 install cryptography"
+    fi
+    local sb; sb="$(kv_sparkle_bin)"
+    if [[ -n $sb ]]; then ok "Sparkle tools  $(tildify "$sb")"
+    else warn "Sparkle tools not found — build a Sparkle app once, or set KEYVAULT_SPARKLE_BIN"; fi
+
+    step "Configuration"
+    [[ -f $KV_CONF ]] && ok "config  $(tildify "$KV_CONF")" || bad "config  $(tildify "$KV_CONF") is missing"
+    [[ -d $KV_DEST ]] && ok "destination  $(tildify "$KV_DEST")" \
+                      || warn "destination  $(tildify "$KV_DEST") does not exist yet (pack will create it)"
+
+    step "Sources declared in keyvault.conf"
+    conf_load
+    local spec
+    for spec in "${KV_SOURCES[@]}"; do
+        local type; type="$(jq -r '.type' <<<"$spec")"
+        case "$type" in
+            sparkle)
+                local a p; a="$(jq -r '.account' <<<"$spec")"; p="$(untildify "$(jq -r '.plist' <<<"$spec")")"
+                if [[ -n $sb ]] && [[ -n "$("$sb/generate_keys" -p --account "$a" 2>/dev/null)" ]]; then
+                    ok "sparkle $a"
+                else
+                    bad "sparkle $a  no such key in the login keychain"
+                fi
+                [[ -n $p ]] && { [[ -f $p ]] && ok "  plist $(tildify "$p")" || bad "  plist $(tildify "$p") not found"; }
+                ;;
+            identities)
+                local k n; k="$(jq -r '.keychain' <<<"$spec")"
+                n="$(security find-identity -v "$k" 2>/dev/null | grep -c '^[[:space:]]*[0-9]*)')"
+                [[ $n -gt 0 ]] && ok "identities $k  $n found" || bad "identities $k  none found"
+                ;;
+            file)
+                local f r; f="$(untildify "$(jq -r '.path' <<<"$spec")")"
+                r="$(resolve_path "$f")"
+                if [[ -f $r ]]; then
+                    [[ $r == "$f" ]] && ok "file $(tildify "$f")" \
+                                     || ok "file $(tildify "$f")  $(dim "-> $(tildify "$r")")"
+                else
+                    bad "file $(tildify "$f")  missing"
+                fi
+                ;;
+            glob)
+                local d pat n
+                d="$(untildify "$(jq -r '.dir' <<<"$spec")")"; pat="$(jq -r '.pattern' <<<"$spec")"
+                n="$(find -L "$d" -maxdepth 1 -type f -name "$pat" 2>/dev/null | wc -l | tr -d ' ')"
+                [[ ${n:-0} -gt 0 ]] && ok "glob $(tildify "$d")/$pat  $n match$([[ $n -gt 1 ]] && echo es)" \
+                                    || warn "glob $(tildify "$d")/$pat  no matches"
+                ;;
+        esac
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------- catalog
+#
+# catalog.json sits next to the artifact, unencrypted, so an agent can learn what exists
+# — ids, kinds, key ids, public keys, expiry — and ask for exactly the right thing.
+# It is built from an allowlist: a field the catalog does not name never leaves the vault.
+# Not even sha256 goes out; for a short typed secret a hash is as good as the value.
+
+catalog_write() {   # catalog_write <manifest>
+    jq --arg t "$(now_utc)" --arg a "$(tildify "$KV_ARTIFACT")" '
+        {catalog_version: 1, generated_at: $t, packed_at, artifact: $a,
+         items: [ .items[] | {
+             id, type, kind: (.kind // .type), desc, path, link, account, public_key, plist,
+             certs: (if .certs then [.certs[] | {name, kind, team_id, sha1, not_after}] else null end),
+             meta: (.meta // {}), adhoc
+         } | with_entries(select(.value != null and .value != "")) ] }' "$1" > "$KV_CATALOG.new" \
+        && mv -f "$KV_CATALOG.new" "$KV_CATALOG" \
+        || warn "could not write $(tildify "$KV_CATALOG")"
+}
+
+# ---------------------------------------------------------------------------- destination README
+
+dest_readme_write() {
+    local f="$KV_DEST/README.txt"
+    cat > "$f" <<EOF
+This folder holds an encrypted backup of signing keys that cannot be re-issued.
+
+    keyvault.age      the backup. Encrypted with age. Safe to sync, copy, email to
+                      yourself — it is useless without the passphrase.
+    archive/          the previous $KV_ARCHIVE_KEEP versions, same encryption.
+
+TO OPEN IT, on any machine:
+
+    brew install age
+    age --decrypt keyvault.age | tar -xzv
+    cat vault/manifest.json
+
+manifest.json says what every file under vault/items/ is and where it belongs.
+
+The tool that made this is keyvault (https://github.com/everlof/keyvault). It is one
+bash script; you do not need it to recover — the two commands above are enough — but it
+automates putting everything back:
+
+    keyvault restore              # shows what it would do
+    keyvault restore --apply      # actually does it
+
+THE PASSPHRASE IS NOT STORED ANYWHERE. If it is lost, so is everything here.
+
+Last written $(now_utc) by $(whoami)@$(hostname -s).
+EOF
+}
+
+# ---------------------------------------------------------------------------- init
+
+cmd_init() {
+    [[ -f $KV_CONF ]] && die "$(tildify "$KV_CONF") already exists — 'keyvault edit' to change it"
+    mkdir -p "$(dirname "$KV_CONF")"
+    cp "$KV_ROOT/keyvault.conf.example" "$KV_CONF" || die "could not write $(tildify "$KV_CONF")"
+    chmod 600 "$KV_CONF"
+    ok "$(tildify "$KV_CONF")"
+    say "Edit it ('keyvault edit'), check it ('keyvault doctor'), then 'keyvault pack'."
+}
+
+# ---------------------------------------------------------------------------- help
+
+cmd_help() {
+    cat <<EOF
+${C_BOLD}keyvault${C_RESET} $KV_VERSION — one encrypted artifact holding every key you cannot re-issue
+
+${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}
+  init                        create your config from keyvault.conf.example
+  pack [--fresh]              collect everything keyvault.conf declares and seal it
+  list                        what is in the vault (names only, no secrets)
+  validate                    does the vault still match this machine?  (exit 2: out of date)
+  verify                      is the vault internally sound? (offline, no keychain)
+  card                        a printable recovery sheet
+
+${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
+  add <id> --file PATH        add a file (an .p8, a licence, anything)
+  add <id> --secret           add a secret typed at the prompt
+  add <id> --stdin            add a secret piped in
+      …  [--desc TEXT] [--restore-to PATH]
+  remove <id>                 take one thing out
+  show <id> --out PATH        write one item back out
+
+${C_BOLD}PUTTING IT BACK${C_RESET}
+  restore [--only ID] [--force]     dry run: says what it would do
+  restore --apply                   do it
+
+${C_BOLD}FOR AGENTS — WHAT EXISTS (no passphrase, no secrets)${C_RESET}
+  catalog [--json]            every item with its public facts (key ids, public keys, expiry)
+  find <text> [--json]        search ids, descriptions and metadata
+  describe <id>               everything known about one item, and how to borrow it
+
+${C_BOLD}FOR AGENTS — BORROWING (a human approves each loan)${C_RESET}
+  request <id>… --reason TEXT [--ttl 30m]   ask; prints the approve command for the human
+  request <id>… --reason TEXT --run -- <cmd…>
+                              one-shot: the human approves this exact command, it runs once
+                              during approval, keys are wiped; collect with 'result'
+  result <grant>              a one-shot's output and exit status
+  approve [ID] [--ttl T]      human, at a terminal: review and grant (passphrase)
+  grant <id>… --reason TEXT [--ttl T]       human: request + approve in one step
+  exec <grant> -- <cmd…>      run a command with \$KV_<ID> pointing at each granted file
+  env <grant>                 the same paths, as export lines
+  grants                      what is pending or on loan right now
+  revoke <grant> | --all      end a loan early (anyone may)
+
+${C_BOLD}THE SAFE, OPENED BY HAND${C_RESET}
+  open [VAULT] / close / abort      several edits on one passphrase entry
+  status                            is anything unlocked right now?
+  doctor                            check tools, config and every declared source
+
+${C_BOLD}ENVIRONMENT${C_RESET}
+  KEYVAULT_DEST         where the artifact lives    (default: 'dest' in the config, else iCloud Drive/Keyvault)
+  KEYVAULT_CONF         config file                 (default: ~/.config/keyvault/keyvault.conf)
+  KEYVAULT_IDENTITY     age identity file — makes every command non-interactive
+  KEYVAULT_SPARKLE_BIN  directory holding generate_keys and sign_update
+
+Config lives in ${C_BOLD}$(tildify "$KV_CONF")${C_RESET} and is plain bash. See README.md.
+EOF
+}
+
+# ---------------------------------------------------------------------------- dispatch
+
+main() {
+    local cmd="${1:-help}"; shift || true
+    case "$cmd" in
+        pack)               cmd_pack "$@" ;;
+        list|ls)            cmd_list "$@" ;;
+        add)                cmd_add "$@" ;;
+        remove|rm)          cmd_remove "$@" ;;
+        show|cat)           cmd_show "$@" ;;
+        verify)             cmd_verify "$@" ;;
+        validate|check)     cmd_validate "$@" ;;
+        restore)            cmd_restore "$@" ;;
+        card)               cmd_card "$@" ;;
+        open)               session_open "${1:-$KV_ARTIFACT}" create; cmd_status ;;
+        close|seal)         session_close ;;
+        abort|discard)      session_abort ;;
+        status)             cmd_status ;;
+        doctor)             cmd_doctor "$@" ;;
+        edit)               "${EDITOR:-vi}" "$KV_CONF" ;;
+        init)               cmd_init ;;
+        catalog|find|describe|request|approve|grant|grants|exec|env|revoke|result|_expire)
+            # Agent access lives in its own file: recovery never needs it, and keeping it
+            # out means a stripped-down copy of this script still restores a dead machine.
+            # shellcheck source=keyvault-access.sh
+            source "$KV_ROOT/keyvault-access.sh" || die "keyvault-access.sh is missing"
+            access_main "$cmd" "$@" ;;
+        version|--version)  say "keyvault $KV_VERSION" ;;
+        help|--help|-h)     cmd_help ;;
+        *)                  die "unknown command '$cmd' — try 'keyvault help'" ;;
+    esac
+}
+
+# Sourcing with KEYVAULT_LIB=1 loads the functions without running a command, which is
+# how tests/test_keyvault.sh reaches the internals.
+[[ ${KEYVAULT_LIB:-0} == 1 ]] || main "$@"

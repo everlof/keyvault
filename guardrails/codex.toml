@@ -1,0 +1,8 @@
+# Merge into ~/.codex*/config.toml by hand (TOML has no safe merge here).
+#
+# workspace-write confines *writes* to the workspace and asks before leaving it.
+# It does not restrict *reads*: Codex can still read any file you can. For Codex the
+# real protection is that plaintext keys no longer exist on disk (the cleanup phase),
+# and that tokens live in the keychain behind `secret`.
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"

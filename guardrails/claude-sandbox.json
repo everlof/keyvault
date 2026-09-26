@@ -1,0 +1,48 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "credentials": {
+      "files": [
+        {
+          "path": "~/.ssh/id_ed25519",
+          "mode": "deny"
+        },
+        {
+          "path": "~/.ssh/id_rsa",
+          "mode": "deny"
+        },
+        {
+          "path": "~/.aws/credentials",
+          "mode": "deny"
+        },
+        {
+          "path": "~/.config/sops/age",
+          "mode": "deny"
+        },
+        {
+          "path": "~/Library/Application Support/sops/age",
+          "mode": "deny"
+        },
+        {
+          "path": "~/.appstoreconnect",
+          "mode": "deny"
+        },
+        {
+          "path": "~/.gnupg/private-keys-v1.d",
+          "mode": "deny"
+        }
+      ],
+      "envVars": [
+        {
+          "name": "KEYVAULT_IDENTITY",
+          "mode": "deny"
+        }
+      ]
+    },
+    "filesystem": {
+      "denyRead": [
+        "/Volumes/keyvault-session"
+      ]
+    }
+  }
+}
