@@ -260,7 +260,13 @@ keyvault secret set LOOPIA_API_PASSWORD --ask   # stored in the keychain, and a 
 keyvault secret rm LOOPIA_API_PASSWORD          # both gone (the vault's archive keeps a copy)
 keyvault secret run LOOPIA_API_PASSWORD -- …    # list, run, get: exactly as `secret`
 keyvault secret backup                          # once, for tokens stored with plain `secret`
+keyvault secret request NAME --desc "…"         # for agents: a dialog asks you for the value
 ```
+
+`request` is how an agent gets a token it must never see: a macOS dialog asks you to paste
+it, and the value goes from the dialog into the keychain and the vault. The dialog shows the
+name, the agent's description and which process is asking, and you choose whether agents may
+use the token freely or whether every use asks you (the default).
 
 `set` reads the value once and hands it to both, so the backup never reads it back from the
 keychain and never raises a dialog, not even for an `--ask` token. The copy sits in

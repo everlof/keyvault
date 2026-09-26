@@ -1289,6 +1289,10 @@ cmd_secret() {
         set)       secret_set "$sb" "$@" ;;
         rm|remove) secret_rm "$sb" "$@" ;;
         backup)    secret_backup "$sb" ;;
+        request)   # an agent asks the user for a token it never sees: agent access lives there
+                   # shellcheck source=keyvault-access.sh
+                   source "$KV_ROOT/keyvault-access.sh" || die "keyvault-access.sh is missing"
+                   secret_request "$sb" "$@" ;;
         *)         exec "$sb" "$sub" "$@" ;;
     esac
 }
@@ -1318,12 +1322,19 @@ secret_set() {
         [[ $v == "$v2" ]] || die "the two entries differ"
     fi
     [[ -n $v ]] || die "empty value"
+    token_store "$sb" "$name" "$ask" "$desc" "$v"
+}
+
+# token_store <secret> <name> <ask 0|1> <desc> <value> — into the keychain, then the vault's
+# copy. A function argument is not a process's argv: the value never shows in `ps`.
+token_store() {
+    local sb="$1" name="$2" ask="$3" desc="$4" err
     # shellcheck disable=SC2046
-    printf '%s' "$v" | "$sb" set "$name" --stdin --desc "$desc" $( ((ask)) && echo --ask) || exit 1
-    if err="$(printf '%s' "$v" | token_seal "$name" "$ask" "$desc" 2>&1 >/dev/null)"; then
-        v=""; ok "$name  backed up in keyvault"
+    printf '%s' "$5" | "$sb" set "$name" --stdin --desc "$desc" $( ((ask)) && echo --ask) || return 1
+    if err="$(printf '%s' "$5" | token_seal "$name" "$ask" "$desc" 2>&1 >/dev/null)"; then
+        ok "$name  backed up in keyvault"
     else
-        v=""; warn "$name  is stored, but NOT backed up in keyvault: ${err#keyvault: }"
+        warn "$name  is stored, but NOT backed up in keyvault: ${err#keyvault: }"
         note "fix that, then run: keyvault secret backup"
         return 1
     fi
@@ -2194,6 +2205,7 @@ ${C_BOLD}TOKENS — the 'secret' tool, backed up${C_RESET}
   secret set NAME [--ask] [--desc T] [--stdin]   store a token, and seal a copy in the vault
   secret rm NAME              remove it, and its copy
   secret backup               copy the tokens stored with plain 'secret' (once)
+  secret request NAME --desc T   for agents: a dialog asks the user for the value; the agent never sees it
   secret run NAME -- <cmd…>   run with it in the environment (list, get: as 'secret')
 
 ${C_BOLD}PUTTING IT BACK${C_RESET}

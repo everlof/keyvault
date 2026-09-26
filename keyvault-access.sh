@@ -246,6 +246,18 @@ cmd_describe() {
 
 grant_new_id() { printf 'kv-%s\n' "$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"; }   # bounded read: no SIGPIPE games
 
+# Who is asking: the process chain above us, e.g. "bash<claude<zsh", so the human can tell
+# an agent's request from their own.
+requester() {
+    local by="" pid="$PPID" n=0 c
+    while (( n++ < 4 )) && [[ -n $pid && $pid != 1 && $pid != 0 ]]; do
+        c="$(ps -o comm= -p "$pid" 2>/dev/null)"; c="$(basename "${c:-?}")"
+        by="${by:+$by<}$c"
+        pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    done
+    printf '%s\n' "${by:-?}"
+}
+
 grant_record() {   # grant_record <reason> <ttl-seconds> <id>…  -> prints gid
     local reason="$1" ttl="$2"; shift 2
     local id toks; toks="$(tokens_items)"
@@ -261,14 +273,7 @@ grant_record() {   # grant_record <reason> <ttl-seconds> <id>…  -> prints gid
     done
     mkdir -p "$KV_GRANTS"; chmod 700 "$KV_STATE" "$KV_GRANTS" 2>/dev/null
     local gid; gid="$(grant_new_id)"
-    # Who is asking: the process chain above us, e.g. "bash<claude<zsh", so the human
-    # can tell an agent's request from their own.
-    local by="" pid="$PPID" n=0 c
-    while (( n++ < 4 )) && [[ -n $pid && $pid != 1 && $pid != 0 ]]; do
-        c="$(ps -o comm= -p "$pid" 2>/dev/null)"; c="$(basename "${c:-?}")"
-        by="${by:+$by<}$c"
-        pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-    done
+    local by; by="$(requester)"
     local run='[]'
     (( ${#LOAN_RUN[@]} )) && run="$(jq -nc '$ARGS.positional' --args -- "${LOAN_RUN[@]}")"   # -- or jq eats a -c
     jq -n --arg id "$gid" --arg r "$reason" --argjson ttl "$ttl" --arg t "$(now_utc)" \
@@ -323,6 +328,59 @@ cmd_request() {
         say "Then run your commands with:  keyvault exec $gid -- <command…>"
         say "And give it back when done:   keyvault revoke $gid"
     fi
+}
+
+# ---------------------------------------------------------------------------- tokens from the user
+#
+# `keyvault secret request NAME --desc TEXT`: an agent needs a token it must never see. A macOS
+# dialog asks the user to paste it, and the value goes from the dialog straight into the
+# keychain and the vault's copy; the agent is told only that it was stored. The user also
+# decides whether agents may use it freely or whether every use asks them (the default).
+
+token_dialog() {   # token_dialog <name> <desc> <requester> <replaces?> -> "<button>\n<value>"
+    if [[ -n ${KEYVAULT_DIALOG:-} ]]; then "$KEYVAULT_DIALOG" "$@"; return; fi   # tests
+    # The agent's text reaches AppleScript as arguments, never as code.
+    osascript - "$@" <<'AS' 2>/dev/null
+on run argv
+    set {nm, ds, who, ex} to {item 1 of argv, item 2 of argv, item 3 of argv, item 4 of argv}
+    set msg to "An agent (" & who & ") asks you to store a token:" & return & return & nm & " — " & ds & return & return & "Paste or type its value. It goes straight into your keychain, with a copy in keyvault. The agent never sees it."
+    if ex is not "" then set msg to msg & return & return & "This REPLACES the current " & nm & "."
+    set r to display dialog msg with title "keyvault" default answer "" with hidden answer buttons {"Cancel", "Agents may use it", "Ask me every use"} default button 3 cancel button 1 with icon caution giving up after 300
+    if gave up of r then return ""
+    return (button returned of r) & linefeed & (text returned of r)
+end run
+AS
+}
+
+secret_request() {
+    local sb="$1"; shift
+    (($#)) || die "usage: keyvault secret request NAME --desc \"what it is, what it is for\""
+    local name="$1"; shift
+    local desc="" by out button v ask replaces=""
+    while (($#)); do
+        case "$1" in
+            --desc) desc="$2"; shift 2 ;;
+            *) die "secret request: unknown option '$1'" ;;
+        esac
+    done
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "'$name' is not a valid name (letters, digits, _)"
+    [[ -n $desc ]] || die "--desc is required: the user reads it in the dialog"
+    [[ -n ${KEYVAULT_DIALOG:-} ]] || have osascript || die "no macOS dialog to ask the user with"
+    tokens_list | jq -e --arg n "$name" 'any(.[]; .name == $n)' >/dev/null && replaces=1
+    by="$(requester)"
+    info "Asking the user for $name in a dialog on their screen…"
+    out="$(token_dialog "$name" "$desc" "$by" "$replaces")" || { audit "token-request $name by=$by cancelled"; die "the user cancelled"; }
+    [[ -n $out ]] || { audit "token-request $name by=$by unanswered"; die "no answer within 5 minutes"; }
+    # "<button>\n<value>"; an empty value loses its newline to the command substitution.
+    button="${out%%$'\n'*}"; v=""; [[ $out == *$'\n'* ]] && v="${out#*$'\n'}"; out=""
+    [[ -n $v ]] || { audit "token-request $name by=$by empty"; die "nothing was entered"; }
+    [[ $button == "Agents may use it" ]] && ask=0 || ask=1
+    token_store "$sb" "$name" "$ask" "$desc" "$v"; local rc=$?
+    v=""
+    (( rc )) && { audit "token-request $name by=$by failed"; return 1; }
+    audit "token-request $name by=$by stored$( ((ask)) && echo ' ask')"
+    if (( ask )); then say "$name is stored. Every use asks the user: keyvault secret run $name -- <command…>"
+    else say "$name is stored. Use it with: keyvault secret run $name -- <command…>"; fi
 }
 
 # ---------------------------------------------------------------------------- approve

@@ -901,6 +901,39 @@ check "restore --apply stores the latest value" "$(TK="$TKC2" tsec get LOOPIA_AP
 check "keeps --ask" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="GUARDED") | .ask')" "true"
 check "and the description" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="LOOPIA_API_PASSWORD") | .desc')" "Loopia API password"
 
+group "keyvault secret request: the agent never sees the value"
+# The dialog is macOS's; this stand-in records what it was shown and answers as told.
+cat > "$T/dialog" <<EOF
+#!/bin/bash
+printf '%s\n' "\$@" > "$T/dialog.args"
+[[ \$FAKE_BUTTON == Cancel ]] && exit 1
+printf '%s\n%s' "\$FAKE_BUTTON" "\$FAKE_VALUE"
+EOF
+chmod +x "$T/dialog"
+treq() { tenv KEYVAULT_DIALOG="$T/dialog" "${NOTTY[@]}" "$SHELL_BIN" "$KV" secret request "$@"; }
+: > "$T/reads"
+out="$(FAKE_BUTTON="Ask me every use" FAKE_VALUE="agent-never-sees" treq AGENT_TOKEN --desc "for the deploy script" 2>&1)"; rc=$?
+check "request exits 0" "$rc" "0"
+grep -q 'agent-never-sees' <<<"$out" && no "the agent's output never holds the value" "$out" || ok "the agent's output never holds the value"
+check "the dialog names the token" "$(sed -n 1p "$T/dialog.args")" "AGENT_TOKEN"
+check "and says what it is for" "$(sed -n 2p "$T/dialog.args")" "for the deploy script"
+[[ -n $(sed -n 3p "$T/dialog.args") ]] && ok "and who is asking" || no "and who is asking"
+check "by default every use asks the user" "$(tsec list --json | jq -r '.[] | select(.name=="AGENT_TOKEN") | .ask')" "true"
+[[ -f $(copy_of AGENT_TOKEN) ]] && ok "and it is backed up" || no "and it is backed up" "$out"
+FAKE_BUTTON="Agents may use it" FAKE_VALUE="free-value" treq AGENT_FREE --desc "free to use" >/dev/null 2>&1
+check "the user can let agents use it freely" "$(tsec list --json | jq -r '.[] | select(.name=="AGENT_FREE") | .ask')" "false"
+check "and the value is the one typed" "$(tsec get AGENT_FREE 2>/dev/null)" "free-value"
+FAKE_BUTTON="Agents may use it" FAKE_VALUE="free-value-2" treq AGENT_FREE --desc "free to use" >/dev/null 2>&1
+check "replacing a token says so in the dialog" "$(sed -n 4p "$T/dialog.args")" "1"
+out="$(FAKE_BUTTON=Cancel treq AGENT_CANCELLED --desc "never mind" 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q cancelled <<<"$out" && ok "a cancelled dialog stores nothing" || no "a cancelled dialog stores nothing" "$out"
+tsec list --json | jq -e 'any(.[]; .name == "AGENT_CANCELLED")' >/dev/null && no "and leaves no token" || ok "and leaves no token"
+out="$(FAKE_BUTTON="Ask me every use" FAKE_VALUE="" treq AGENT_EMPTY --desc "empty" 2>&1)"
+grep -q 'nothing was entered' <<<"$out" && ok "an empty answer is refused" || no "an empty answer is refused" "$out"
+treq AGENT_NODESC >/dev/null 2>&1 && no "--desc is required" || ok "--desc is required"
+grep -q 'token-request AGENT_TOKEN by=.* stored ask' "$T/state/audit.log" && ok "requests are audited" || no "requests are audited" "$(cat "$T/state/audit.log" 2>&1)"
+check "a request never reads a token" "$(reads)" ""
+
 # ---------------------------------------------------------------------------- ramdisk
 
 group "RAM-disk workspace (the real path, not the fallback)"

@@ -54,6 +54,15 @@ API keys and deploy tokens live in the keychain, not in env files or shell profi
 
 (`secret run` is the same thing.) Never `set` or `rm` a token unless the user asked you to.
 
+**Need a token that isn't there?** Don't ask the user to paste it into the chat. Ask for it:
+
+    keyvault secret request LOOPIA_API_PASSWORD --desc "Loopia API password, for the DNS script"
+
+A dialog on the user's screen asks them for the value. It goes from there into the keychain,
+with a backup in the vault, and you never see it. They also choose whether you may use it
+freely or whether every use asks them first. Then use it with `keyvault secret run`.
+Name it the way the tool expects (`UPPER_SNAKE`), and say in `--desc` what it is for.
+
 Items marked `ask` raise a macOS dialog the user must click. If one appears, tell them what
 you are running and why. Never use `secret get` in scripts, or print a value.
 
@@ -73,9 +82,9 @@ in case".
 
 ## Never
 
-- Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY` or `KEYVAULT_RECOVERY_IDENTITY`,
-  or run `setup`, `show`, `restore`, `verify`, `pack`, `add` or `remove`. Those are the
-  user's commands.
+- Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY`, `KEYVAULT_RECOVERY_IDENTITY`
+  or `KEYVAULT_DIALOG`, or run `setup`, `show`, `restore`, `verify`, `pack`, `add` or
+  `remove`. Those are the user's commands.
 - Read `/Volumes/keyvault-*` directly, or copy granted files elsewhere.
 - Copy a key into a repo, a `.env`, a log, a chat message or a CI secret without being asked
   to, in so many words.
