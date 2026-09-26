@@ -261,7 +261,12 @@ keyvault secret rm LOOPIA_API_PASSWORD          # both gone (the vault's archive
 keyvault secret run LOOPIA_API_PASSWORD -- …    # list, run, get: exactly as `secret`
 keyvault secret backup                          # once, for tokens stored with plain `secret`
 keyvault secret request NAME --desc "…"         # for agents: a dialog asks you for the value
+keyvault secret set LOOPIA_API_USER --plain my-app@loopiaapi   # not a secret: shown, kept alongside
 ```
+
+A `--plain` value is not a secret: a username or an account id that goes with one. It sits in
+the keychain beside the secret so `run` can hand both out (`keyvault secret run
+LOOPIA_API_USER LOOPIA_API_PASSWORD -- …`), and `list` and the catalog show its value.
 
 `request` is how an agent gets a token it must never see: a macOS dialog asks you to paste
 it, and the value goes from the dialog into the keychain and the vault. The dialog shows the

@@ -861,6 +861,12 @@ check "the token is in the keychain" "$(tsec get LOOPIA_API_PASSWORD 2>/dev/null
 [[ -f $(copy_of LOOPIA_API_PASSWORD) ]] && ok "and a copy is sealed in the vault" || no "and a copy is sealed in the vault" "$(ls "$T/dest/keyvault/added" 2>&1)"
 printf 'guarded-value' | tkv secret set GUARDED --stdin --ask --desc "an ask token" >/dev/null 2>&1
 [[ -f $(copy_of GUARDED) ]] && ok "an --ask token is backed up too" || no "an --ask token is backed up too"
+out="$(tkv secret set LOOPIA_API_USER --plain my-app@loopiaapi --desc "Loopia API user" 2>&1)"; rc=$?
+check "a plain value is stored as given, no prompt" "$rc" "0"
+[[ -f $(copy_of LOOPIA_API_USER) ]] && ok "and backed up" || no "and backed up" "$out"
+check "run hands it out with the secret it goes with" \
+    "$(tkv secret run LOOPIA_API_USER LOOPIA_API_PASSWORD -- sh -c 'printf %s "$LOOPIA_API_USER:$LOOPIA_API_PASSWORD"' 2>/dev/null)" \
+    "my-app@loopiaapi:loopia-pw"
 check "storing never reads a token back: no dialog, even for --ask" "$(reads)" ""
 grep -rqE 'loopia-pw|guarded-value' "$T/dest" && no "no value reaches the vault folder in the clear" || ok "no value reaches the vault folder in the clear"
 check "run passes through to secret" "$(tkv secret run LOOPIA_API_PASSWORD -- sh -c 'printf %s "$LOOPIA_API_PASSWORD"' 2>/dev/null)" "loopia-pw"
@@ -870,11 +876,14 @@ group "keyvault catalog: one place to look"
 out="$(tkv catalog 2>&1)"
 grep -qE '^LOOPIA_API_PASSWORD +run +token' <<<"$out" && ok "tokens are in the catalog" || no "tokens are in the catalog" "$out"
 grep -qE '^GUARDED +ask ' <<<"$out" && ok "an --ask token shows as ask" || no "an --ask token shows as ask" "$out"
+grep -qE '^LOOPIA_API_USER +plain +token += my-app@loopiaapi' <<<"$out" && ok "a plain value shows with its value" || no "a plain value shows with its value" "$out"
+grep -q 'loopia-pw' <<<"$out" && no "a secret's value never shows" "$out" || ok "a secret's value never shows"
 grep -qE 'no backup|out of date' <<<"$out" && no "both show as backed up" "$out" || ok "both show as backed up"
 grep -q '^secret-' <<<"$out" && no "a token's copy is not listed twice" "$out" || ok "a token's copy is not listed twice"
 out="$(tkv describe LOOPIA_API_PASSWORD 2>&1)"
 grep -q 'keyvault secret run LOOPIA_API_PASSWORD -- ' <<<"$out" && ok "describe says how to use a token" || no "describe says how to use a token" "$out"
 grep -q 'keychain dialog' <<<"$(tkv describe GUARDED 2>&1)" && ok "and warns when every use asks the user" || no "and warns when every use asks the user"
+grep -q 'Not a secret' <<<"$(tkv describe LOOPIA_API_USER 2>&1)" && ok "and says a plain value is not a secret" || no "and says a plain value is not a secret"
 grep -q LOOPIA_API_PASSWORD <<<"$(tkv find loopia 2>&1)" && ok "find searches tokens" || no "find searches tokens"
 grep -q "is a token" <<<"$(tkv request LOOPIA_API_PASSWORD --reason test 2>&1)" \
     && ok "requesting a token points to keyvault secret run" || no "requesting a token points to keyvault secret run"
@@ -908,6 +917,7 @@ TK="$TKC2" tkv restore --apply >/dev/null 2>&1
 check "restore --apply stores the latest value" "$(TK="$TKC2" tsec get LOOPIA_API_PASSWORD 2>/dev/null)" "loopia-pw2"
 check "keeps --ask" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="GUARDED") | .ask')" "true"
 check "and the description" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="LOOPIA_API_PASSWORD") | .desc')" "Loopia API password"
+check "a plain value comes back plain" "$(TK="$TKC2" tsec list --json | jq -r '.[] | select(.name=="LOOPIA_API_USER") | "\(.plain) \(.value)"')" "true my-app@loopiaapi"
 
 group "keyvault secret request: the agent never sees the value"
 # The dialog is macOS's; this stand-in records what it was shown and answers as told.

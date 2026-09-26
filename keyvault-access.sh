@@ -74,7 +74,8 @@ tokens_items() {
     copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // "")}]' "$KV_CATALOG" 2>/dev/null)"
     [[ -n $copies ]] || copies='[]'
     tokens_list | jq -c --argjson b "$copies" 'map(. as $k | {id: .name, type: "token", kind: "token",
-        level: (if .ask then "ask" else "run" end), desc,
+        level: (if .ask then "ask" elif .plain then "plain" else "run" end), desc}
+        + (if .plain then {value} else {} end) + {
         backup: (if any($b[]; .t == $k.name and .c == ($k.changed // "")) then "current"
                  elif any($b[]; .t == $k.name) then "stale" else "none" end)})'
 }
@@ -174,7 +175,8 @@ item_line() {   # one catalog item -> one line of the table
             if .kind == "asc-api-key" then "key \(.meta.asc_key_id)" + (if .meta.issuer_id then "  issuer \(.meta.issuer_id)" else "" end)
             elif .type == "sparkle" then "ed25519 \(.public_key)"
             elif .type == "identities" then "\(.certs | length) certs: " + ([.certs[].team_id // empty] | unique | join(","))
-            elif .type == "token" then (.desc // "") + ({current: "", stale: "  (backup out of date)", none: "  (no backup)"}[.backup] // "")
+            elif .type == "token" then (if .value then "= \(.value)  " else "" end) + (.desc // "")
+                + ({current: "", stale: "  (backup out of date)", none: "  (no backup)"}[.backup] // "")
             elif .meta.subject then .meta.subject
             elif .meta.age_recipient then .meta.age_recipient
             elif .path then .path
@@ -200,7 +202,8 @@ cmd_catalog() {
     while IFS= read -r it; do item_line "$it"; done < <(all_items | jq -c '.[]')
     say ""
     say "$(dim "LEVEL: biometric/passphrase/both — a vault item, borrowed with 'keyvault request'.")"
-    say "$(dim "       run/ask — a token, used with 'keyvault secret run'; ask: every use asks the user.")"
+    say "$(dim "       run/ask/plain — a token, used with 'keyvault secret run'; ask: every use asks the")"
+    say "$(dim "       user; plain: not a secret, its value is shown.")"
     say "$(dim "keyvault describe <id> for everything known about one item; keyvault find <text> to search.")"
 }
 
@@ -223,6 +226,11 @@ cmd_describe() {
     jq . <<<"$it"
     if [[ $(jq -r '.type' <<<"$it") == token ]]; then
         say ""
+        if [[ $(jq -r '.level' <<<"$it") == plain ]]; then
+            say "Not a secret: its value is above. Pass it with the secrets it goes with:"
+            say "  keyvault secret run $1 <SECRET_NAME> -- <command…>"
+            return 0
+        fi
         say "A token. Use it for one command, never print or copy it:"
         say "  keyvault secret run $1 -- <command…>     (\$$1 is set for that command only)"
         say "  keyvault secret run OTHER_NAME=$1 -- …   (under the name the tool expects)"

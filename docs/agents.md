@@ -30,6 +30,7 @@ The LEVEL column says how an item is used:
 | `biometric`, `passphrase`, `both` | a key in the vault | borrow it: `keyvault request` (below) |
 | `run` | a token | `keyvault secret run NAME -- <command>` |
 | `ask` | a token that asks the user every time | the same, after telling the user |
+| `plain` | not a secret (a username, an id); the catalog shows its value | pass it with its secret: `keyvault secret run USER PASSWORD -- …` |
 
 ## First: does it need the vault at all?
 
@@ -63,6 +64,13 @@ A dialog on the user's screen asks them for the value. It goes from there into t
 with a backup in the vault, and you never see it. They also choose whether you may use it
 freely or whether every use asks them first. Then use it with `keyvault secret run`.
 Name it the way the tool expects (`UPPER_SNAKE`), and say in `--desc` what it is for.
+
+**Not everything is a secret.** A username, an account or project id, a region: don't
+`request` those (a hidden dialog for a username is just friction). Store them yourself, next
+to the secret they go with:
+
+    keyvault secret set LOOPIA_API_USER --plain my-app@loopiaapi --desc "Loopia API user"
+    keyvault secret run LOOPIA_API_USER LOOPIA_API_PASSWORD -- ./dns.py
 
 **Asked to back up a key file?** Seal it as it is, without opening it:
 

@@ -41,6 +41,16 @@ sleep 1; printf 'v3' | sec set API_TOKEN --stdin --desc "rotated" 2>/dev/null
     && ok "and a new value moves it" || no "and a new value moves it"
 printf 'v2' | sec set API_TOKEN --stdin --desc "rotated" 2>/dev/null
 
+sec set ACCOUNT_ID --plain acct-123 --desc "an account id" 2>/dev/null
+check "--plain stores a value that is not a secret" "$(sec get ACCOUNT_ID 2>/dev/null)" "acct-123"
+check "list --json shows a plain value" "$(sec list --json | jq -r '.[] | select(.name=="ACCOUNT_ID") | .value')" "acct-123"
+check "and marks it plain" "$(sec list --json | jq -r '.[] | select(.name=="ACCOUNT_ID") | .plain')" "true"
+check "but never a secret's value" "$(sec list --json | jq -r '.[] | select(.name=="API_TOKEN") | has("value")')" "false"
+grep -q 'acct-123' <<<"$(sec list)" && ok "list shows it too" || no "list shows it too"
+sec set BOTH --plain x --ask >/dev/null 2>&1 && no "--plain and --ask are refused together" || ok "--plain and --ask are refused together"
+sec set EMPTY --plain >/dev/null 2>&1 && no "--plain wants a value" || ok "--plain wants a value"
+sec rm ACCOUNT_ID >/dev/null 2>&1
+
 check "run puts the secret in the command's environment" \
     "$(sec run API_TOKEN -- sh -c 'printf %s "$API_TOKEN"')" "v2"
 check "run VAR=NAME renames it" "$(sec run TOKEN=API_TOKEN -- sh -c 'printf %s "$TOKEN"')" "v2"

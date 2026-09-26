@@ -183,10 +183,11 @@ tokens_list() {
 # copy gone stale shows without decrypting anything.
 token_id()      { printf 'secret-%s\n' "$1"; }
 token_changed() { tokens_list | jq -r --arg n "$1" '.[] | select(.name == $n) | .changed // ""'; }
-token_seal() {   # token_seal <name> <ask 0|1> <desc> — the value on stdin
+token_seal() {   # token_seal <name> <ask 0|1> <desc> [plain 0|1] — the value on stdin
     local changed; changed="$(token_changed "$1" </dev/null)"
     "${BASH:-bash}" "$KV_ROOT/keyvault" add "$(token_id "$1")" --stdin --level both --desc "$3" \
-        --meta "token=$1" --meta "ask=$( (( $2 )) && echo true || echo false)" --meta "changed=$changed"
+        --meta "token=$1" --meta "ask=$( (( $2 )) && echo true || echo false)" --meta "changed=$changed" \
+        $( (( ${4:-0} )) && echo --meta plain=true)
 }
 
 # ------------------------------------------------------------- ed25519, without a keychain
@@ -1304,6 +1305,8 @@ ${C_BOLD}keyvault secret${C_RESET} — tokens in the macOS keychain, one command
 
   set NAME [--ask] [--desc T] [--stdin]   store it (typed, or piped), and seal a copy in the vault
                                          --ask: every use raises the keychain dialog
+  set NAME --plain VALUE [--desc T]      not a secret (a username, an account id): stored beside
+                                         the secrets it goes with, its value shown in list and catalog
   request NAME --desc T     for agents: a dialog asks the user for the value; the agent never sees it
   run NAME [VAR=NAME …] -- <command…>    run with those tokens in the environment, for that command only
   list [--json]             names and descriptions, never values
@@ -1315,20 +1318,24 @@ EOF
 
 secret_set() {
     local sb="$1"; shift
-    (($#)) || die "usage: keyvault secret set NAME [--desc TEXT] [--ask] [--stdin]"
+    (($#)) || die "usage: keyvault secret set NAME [--desc TEXT] [--ask | --plain VALUE] [--stdin]"
     local name="$1"; shift
-    local desc="" ask=0 stdin=0 v v2 err
+    local desc="" ask=0 stdin=0 plain=0 v="" v2 err
     while (($#)); do
         case "$1" in
             --desc)  desc="$2"; shift 2 ;;
             --ask)   ask=1; shift ;;
+            --plain) plain=1; v="${2:-}"; shift 2 || die "--plain wants the value: it is not a secret" ;;
             --stdin) stdin=1; shift ;;
             *) die "secret set: unknown option '$1'" ;;
         esac
     done
     [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "'$name' is not a valid name (letters, digits, _)"
+    (( ask && plain )) && die "--ask and --plain contradict each other"
     # Read once, here: the value goes to both places and is never read back from the keychain.
-    if (( stdin )); then
+    if (( plain )); then
+        :   # given on the command line: it is not a secret
+    elif (( stdin )); then
         v="$(cat)"
     else
         { exec 4</dev/tty; } 2>/dev/null || die "no terminal to type into — use --stdin"
@@ -1338,16 +1345,21 @@ secret_set() {
         [[ $v == "$v2" ]] || die "the two entries differ"
     fi
     [[ -n $v ]] || die "empty value"
-    token_store "$sb" "$name" "$ask" "$desc" "$v"
+    token_store "$sb" "$name" "$ask" "$desc" "$v" "$plain"
 }
 
-# token_store <secret> <name> <ask 0|1> <desc> <value> — into the keychain, then the vault's
-# copy. A function argument is not a process's argv: the value never shows in `ps`.
+# token_store <secret> <name> <ask 0|1> <desc> <value> [plain 0|1] — into the keychain, then
+# the vault's copy. A function argument is not a process's argv: the value never shows in
+# `ps`. (A plain value does: it is not a secret.)
 token_store() {
-    local sb="$1" name="$2" ask="$3" desc="$4" err
-    # shellcheck disable=SC2046
-    printf '%s' "$5" | "$sb" set "$name" --stdin --desc "$desc" $( ((ask)) && echo --ask) || return 1
-    if err="$(printf '%s' "$5" | token_seal "$name" "$ask" "$desc" 2>&1 >/dev/null)"; then
+    local sb="$1" name="$2" ask="$3" desc="$4" plain="${6:-0}" err
+    if (( plain )); then
+        "$sb" set "$name" --plain "$5" --desc "$desc" || return 1
+    else
+        # shellcheck disable=SC2046
+        printf '%s' "$5" | "$sb" set "$name" --stdin --desc "$desc" $( ((ask)) && echo --ask) || return 1
+    fi
+    if err="$(printf '%s' "$5" | token_seal "$name" "$ask" "$desc" "$plain" 2>&1 >/dev/null)"; then
         ok "$name  backed up in keyvault"
     else
         warn "$name  is stored, but NOT backed up in keyvault: ${err#keyvault: }"
@@ -1376,7 +1388,8 @@ secret_backup() {   # copy every token whose copy is missing or older than the t
             <<<"$copies" >/dev/null && continue
         [[ $ask == true ]] && info "  reading $name raises the keychain dialog — click Allow"
         if err="$("$sb" get "$name" 2>/dev/null \
-                  | token_seal "$name" "$([[ $ask == true ]] && echo 1 || echo 0)" "$(jq -r '.desc // ""' <<<"$t")" 2>&1 >/dev/null)"; then
+                  | token_seal "$name" "$([[ $ask == true ]] && echo 1 || echo 0)" "$(jq -r '.desc // ""' <<<"$t")" \
+                               "$([[ $(jq -r '.plain // false' <<<"$t") == true ]] && echo 1 || echo 0)" 2>&1 >/dev/null)"; then
             ok "$name  backed up"; n=$((n + 1))
         else
             bad "$name  ${err#keyvault: }"; rc=1
@@ -1785,11 +1798,16 @@ cmd_restore() {
                     if tokens_list | jq -e --arg n "$token" 'any(.[]; .name == $n)' >/dev/null && (( ! force )); then
                         note "$id  $token is already in 'secret' — --force replaces it"; continue
                     fi
-                    say "$(act)store $token with 'secret'$([[ $ask == true ]] && echo ' (--ask)')"
+                    local plain; plain="$(jq -r '.meta.plain // "false"' <<<"$it")"
+                    say "$(act)store $token with 'secret'$([[ $ask == true ]] && echo ' (--ask)')$([[ $plain == true ]] && echo ' (--plain)')"
                     if (( apply )); then
-                        # shellcheck disable=SC2046
-                        "$sb" set "$token" --stdin --desc "$(jq -r '.desc // ""' <<<"$it")" $([[ $ask == true ]] && echo --ask) \
-                            <"$full" >/dev/null 2>&1 && ok "$id  stored" || { bad "$id  could not store $token"; rc=1; }
+                        if [[ $plain == true ]]; then
+                            "$sb" set "$token" --plain "$(cat "$full")" --desc "$(jq -r '.desc // ""' <<<"$it")" >/dev/null 2>&1
+                        else
+                            # shellcheck disable=SC2046
+                            "$sb" set "$token" --stdin --desc "$(jq -r '.desc // ""' <<<"$it")" $([[ $ask == true ]] && echo --ask) \
+                                <"$full" >/dev/null 2>&1
+                        fi && ok "$id  stored" || { bad "$id  could not store $token"; rc=1; }
                     fi
                     continue
                 fi
@@ -2223,6 +2241,7 @@ ${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
 
 ${C_BOLD}TOKENS — the 'secret' tool, backed up${C_RESET}
   secret set NAME [--ask] [--desc T] [--stdin]   store a token, and seal a copy in the vault
+  secret set NAME --plain VALUE [--desc T]       not a secret (a username, an id): shown, not hidden
   secret rm NAME              remove it, and its copy
   secret backup               copy the tokens stored with plain 'secret' (once)
   secret request NAME --desc T
@@ -2275,10 +2294,11 @@ ${C_BOLD}FIND${C_RESET}  (asks nothing, shows no value)
   keyvault find <text>        e.g. an app, a team id, a key id, "loopia"
   keyvault describe <id>      everything known about one, and exactly how to use it
 
-${C_BOLD}USE A TOKEN${C_RESET}  (LEVEL run or ask)
-  keyvault secret run NAME -- <command…>          \$NAME is set for that command only
+${C_BOLD}USE A TOKEN${C_RESET}  (LEVEL run, ask or plain)
+  keyvault secret run NAME… -- <command…>         each \$NAME is set for that command only
   keyvault secret run TOOL_VAR=NAME -- <command…> under the name the tool expects
   ask: every use raises a dialog the user must click. Tell them before you run it.
+  plain: not a secret; the catalog shows its value.
 
 ${C_BOLD}USE A KEY${C_RESET}  (LEVEL biometric, passphrase or both: only the user can unlock it)
   keyvault request <id> --reason "…" --run -- <command…>
@@ -2289,9 +2309,12 @@ ${C_BOLD}USE A KEY${C_RESET}  (LEVEL biometric, passphrase or both: only the use
         and:  keyvault revoke <grant>               as soon as you are done
 
 ${C_BOLD}STORE ONE${C_RESET}  (only when the user asks you to)
-  a token:     keyvault secret request NAME --desc "what it is, what it is for"
+  a secret:    keyvault secret request NAME --desc "what it is, what it is for"
                A dialog asks the user for the value; it goes into the keychain and the
                vault and never passes through you. Never ask for it in the chat.
+  not secret:  keyvault secret set NAME --plain VALUE --desc "…"
+               A username, an account or project id, a region: store it yourself, no dialog.
+               Don't 'request' those. Then: keyvault secret run USER_NAME PASSWORD_NAME -- …
   a key file:  keyvault add <id> --file PATH --level both --desc "what it is"
                The file is sealed as it is. Don't open, print or copy it.
   If the user pasted a secret into the chat, it is exposed: use 'secret request' anyway, so
