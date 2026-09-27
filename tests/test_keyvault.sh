@@ -865,7 +865,13 @@ ikv verify >/dev/null 2>&1
 check "verify reads it along with the rest" "$?" "0"
 ikv pack --refresh >/dev/null 2>&1
 check "pack --refresh exports anyway" "$(exports)" "2"
+ikv checkup --no-scan >/dev/null 2>&1
+check "checkup: nothing to do while the vault has every identity" "$?" "0"
 valid one two three > "$I/identities"
+out="$(ikv checkup --no-scan 2>&1)"; rc=$?
+check "checkup: a new identity in the keychain is a pack to do" "$rc" "2"
+grep -q 'keyvault-test-three' <<<"$out" && grep -q 'keyvault pack' <<<"$out" && ok "naming it, and what to run" || no "naming it, and what to run" "$out"
+check "without exporting anything to find out" "$(exports)" "2"
 ikv pack >/dev/null 2>&1
 check "a new identity in the keychain means a new export" "$(exports)" "3"
 check "and the catalog follows" "$(jq -r '.items[] | select(.id=="identities-test") | .certs | length' "$I/dest/catalog.json")" "3"
@@ -982,6 +988,8 @@ group "keyvault secret request: the agent never sees the value"
 # The dialog is macOS's; this stand-in records what it was shown and answers as told.
 cat > "$T/dialog" <<EOF
 #!/bin/bash
+# The second dialog asks when the token stops working: answered from FAKE_EXPIRES.
+[[ \$1 == --expires ]] && { printf '%s\n' "\$@" > "$T/expiry.args"; printf '%s' "\${FAKE_EXPIRES:-}"; exit 0; }
 printf '%s\n' "\$@" > "$T/dialog.args"
 [[ \$FAKE_BUTTON == Cancel ]] && exit 1
 printf '%s\n%s' "\$FAKE_BUTTON" "\$FAKE_VALUE"
@@ -1066,6 +1074,381 @@ grep -q 'Face ID approvals are off' <<<"$out" && ok "without Threading it says w
 kv device remove iphone >/dev/null 2>&1
 [[ -e $KEYVAULT_KEYS/biometric.iphone.envelope ]] && no "device remove iphone forgets it" || ok "device remove iphone forgets it"
 kill "$FAKE_PID" 2>/dev/null; FAKE_PID=""
+
+# ---------------------------------------------------------------------------- expiry
+
+group "Expiry: dates are checked, spans count from today"
+xp() { KEYVAULT_TODAY=2026-01-31 KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; expiry_parse '$1'"; }
+check "a date stays as given" "$(xp 2026-12-01)" "2026-12-01"
+check "90d counts from today" "$(xp 90d)" "2026-05-01"
+check "1m from Jan 31 is the end of February, not March" "$(xp 1m)" "2026-02-28"
+check "1y" "$(xp 1y)" "2027-01-31"
+check "never" "$(xp never)" "never"
+xp 2026-02-30 >/dev/null && no "Feb 30 is refused, not rolled into March" || ok "Feb 30 is refused, not rolled into March"
+xp soon >/dev/null && no "words are refused" || ok "words are refused"
+xp 2026-1-5 >/dev/null && no "a date needs all its digits" || ok "a date needs all its digits"
+xp 9999y >/dev/null && no "a span past year 9999 is refused" || ok "a span past year 9999 is refused"
+
+group "Expiry: a token's date, from set to renew"
+export KEYVAULT_TODAY=2026-01-20
+: > "$T/reads"
+out="$(printf 'exp-value' | tkv secret set EXP_TOKEN --stdin --desc "expires soon" --expires 2026-02-01 2>&1)"; rc=$?
+check "set --expires exits 0" "$rc" "0"
+grep -q 'expires 2026-02-01 (in 12 days)' <<<"$out" && ok "and says when, and how far off" || no "and says when, and how far off" "$out"
+grep -q 'keyvault remind' <<<"$out" && ok "and how to get a reminder" || no "and how to get a reminder" "$out"
+check "the date is in the catalog" "$(jq -r '.items[] | select(.id=="secret-EXP_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2026-02-01"
+out="$(tkv expiring 2>&1)"; rc=$?
+check "expiring exits 2 when one is due within 30 days" "$rc" "2"
+grep -qE '^2026-02-01 +in 12 days +token +EXP_TOKEN' <<<"$out" && ok "and lists it" || no "and lists it" "$out"
+grep -q 'keyvault secret set EXP_TOKEN --expires' <<<"$out" && ok "with how to renew it" || no "with how to renew it" "$out"
+check "--json carries the days left" "$(tkv expiring --json | jq -r '.[] | select(.name=="EXP_TOKEN") | .days')" "12"
+out="$(tkv expiring --within 5 2>&1)"; rc=$?
+check "--within narrows it: nothing within 5 days" "$rc" "0"
+grep -qE '^EXP_TOKEN +run +token +expires in 12 d' <<<"$(tkv catalog 2>&1)" && ok "the catalog flags it" || no "the catalog flags it" "$(tkv catalog 2>&1)"
+grep -q 'Expires 2026-02-01 (in 12 days)' <<<"$(tkv describe EXP_TOKEN 2>&1)" && ok "describe says when" || no "describe says when"
+check "--expires --json for agents" "$(tkv catalog --json | jq -r '.tokens[] | select(.id=="EXP_TOKEN") | .expires')" "2026-02-01"
+out="$(printf 'exp-value-2' | tkv secret set EXP_TOKEN --stdin --desc "expires soon" 2>&1)"
+check "a replacement keeps the date" "$(jq -r '.items[] | select(.id=="secret-EXP_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2026-02-01"
+grep -q 'still expires 2026-02-01' <<<"$out" && ok "and says so" || no "and says so" "$out"
+: > "$T/reads"
+out="$(tkv secret expires EXP_TOKEN 1y 2>&1)"; rc=$?
+check "secret expires exits 0" "$rc" "0"
+check "and re-dates the copy" "$(jq -r '.items[] | select(.id=="secret-EXP_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2027-01-20"
+check "from the value in the keychain, read once" "$(reads)" "EXP_TOKEN "
+check "which is unchanged" "$(tsec get EXP_TOKEN 2>/dev/null)" "exp-value-2"
+tkv validate >/dev/null 2>&1
+check "the copy still counts as current" "$?" "0"
+tkv secret expires EXP_TOKEN never >/dev/null 2>&1
+tkv expiring --json | jq -e 'any(.[]; .name == "EXP_TOKEN")' >/dev/null && no "never takes it off the list" || ok "never takes it off the list"
+tkv secret expires NO_SUCH_TOKEN 90d >/dev/null 2>&1 && no "an unknown token is refused" || ok "an unknown token is refused"
+before="$(jq -c '.items[] | select(.id=="secret-GUARDED")' "$T/dest/catalog.json")"
+out="$(tkv secret expires GUARDED 90d 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q 'keychain dialog' <<<"$out" && ok "an --ask token warns of the dialog, and a refusal stops it" || no "an --ask token warns of the dialog, and a refusal stops it" "$out"
+check "leaving its copy as it was" "$(jq -c '.items[] | select(.id=="secret-GUARDED")' "$T/dest/catalog.json")" "$before"
+out="$(printf 'x' | tkv secret set BAD_DATE --stdin --expires 2026-13-01 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q 'wants a date' <<<"$out" && ok "a bad date is refused" || no "a bad date is refused" "$out"
+tsec list --json | jq -e 'any(.[]; .name == "BAD_DATE")' >/dev/null && no "before anything is stored" || ok "before anything is stored"
+
+group "Expiry: typed, asked; requested, asked in the dialog; backed up, kept"
+out="$(onpty $'typed-value\ntyped-value\n45d\n' env SECRET_KEYCHAIN="$TKC" SECRET_STATE="$T/sstate" KEYVAULT_SECRET_BIN="$T/secret" \
+    KEYVAULT_CONF="$T/keyvault.conf" KEYVAULT_DEST="$T/dest" KEYVAULT_STATE="$T/state" KEYVAULT_MOUNT="$T/mount" \
+    "$SHELL_BIN" "$KV" secret set TYPED_TOKEN --desc typed 2>&1)"
+grep -q 'Expires?' <<<"$out" && ok "typing a token asks when it expires" || no "typing a token asks when it expires" "$out"
+check "and records the answer" "$(jq -r '.items[] | select(.id=="secret-TYPED_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2026-03-06"
+out="$(FAKE_BUTTON="Agents may use it" FAKE_VALUE="req-value" FAKE_EXPIRES="90d" treq REQ_TOKEN --desc "requested" 2>&1)"
+check "a request asks for the date too" "$(jq -r '.items[] | select(.id=="secret-REQ_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2026-04-20"
+grep -q 'req-value' <<<"$out" && no "and still never shows the value" "$out" || ok "and still never shows the value"
+rm -f "$T/expiry.args"
+FAKE_BUTTON="Agents may use it" FAKE_VALUE="req-value" treq REQ_TOKEN --desc "requested" --expires 2026-06-01 >/dev/null 2>&1
+[[ -e $T/expiry.args ]] && no "an agent's --expires skips that dialog" || ok "an agent's --expires skips that dialog"
+check "and is used" "$(jq -r '.items[] | select(.id=="secret-REQ_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2026-06-01"
+sleep 1; printf 'req-value-2' | tsec set REQ_TOKEN --stdin --desc "requested" 2>/dev/null
+tkv secret backup >/dev/null 2>&1
+check "a token re-copied by backup keeps its date" "$(jq -r '.items[] | select(.id=="secret-REQ_TOKEN") | .meta.expires' "$T/dest/catalog.json")" "2026-06-01"
+printf 'licence' | tkv add licence-key --stdin --desc "a licence" --expires 2026-02-10 >/dev/null 2>&1
+check "add --expires dates a hand-added item" "$(jq -r '.items[] | select(.id=="licence-key") | .meta.expires' "$T/dest/catalog.json")" "2026-02-10"
+out="$(tkv validate 2>&1)"; rc=$?
+check "validate exits 2 when something expires within 30 days" "$rc" "2"
+grep -q 'licence-key  expires 2026-02-10 (in 21 days)' <<<"$out" && ok "and names it" || no "and names it" "$out"
+out="$(KEYVAULT_TODAY=2026-03-01 tkv expiring 2>&1)"
+grep -qE '^2026-02-10 +19 days ago +secret +licence-key' <<<"$out" && ok "once past, it shows how long ago" || no "once past, it shows how long ago" "$out"
+tkv remove licence-key >/dev/null 2>&1
+
+group "Expiry: a date that cannot be read stays contained"
+out="$(printf 'x' | tkv add bad-meta --stdin --meta expires=soon 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q 'wants a date' <<<"$out" && ok "add --meta expires= is checked like --expires" || no "add --meta expires= is checked like --expires" "$out"
+cp "$T/keyvault.conf" "$T/keyvault.conf.bak"
+printf 'meta beta expires=next-spring\n' >> "$T/keyvault.conf"
+out="$(tkv pack 2>&1)"
+grep -q 'expires=next-spring is not a date' <<<"$out" && ok "pack says so about a date in the config" || no "pack says so about a date in the config" "$out"
+check "and leaves it out of the catalog" "$(jq -r '.items[] | select(.id=="beta") | .meta.expires // "none"' "$T/dest/catalog.json")" "none"
+printf 'meta beta expires=90d\n' > "$T/keyvault.conf.x"; cat "$T/keyvault.conf.bak" "$T/keyvault.conf.x" > "$T/keyvault.conf"
+grep -q 'expires=90d is not a date' <<<"$(tkv pack 2>&1)" && ok "the config takes dates, not spans" || no "the config takes dates, not spans"
+mv "$T/keyvault.conf.bak" "$T/keyvault.conf"; tkv pack >/dev/null 2>&1
+# The locale decides what %b reads: a Swedish one wants "okt", and a certificate says "Oct".
+out="$(LC_ALL=sv_SE.UTF-8 akv expiring --json 2>/dev/null)"
+check "a certificate's date reads under any locale" "$(jq -r '[.[] | select(.name=="client-cert")] | length' <<<"$out")" "1"
+out="$(LC_ALL=sv_SE.UTF-8 KEYVAULT_TODAY="$(date +%F)" akv catalog 2>&1)"      # the fixture's certificate: 30 days from now
+grep -qE '^client-cert .*expires in' <<<"$out" && ok "in the catalog too" || no "in the catalog too" "$out"
+
+# ---------------------------------------------------------------------------- reminders
+#
+# Reminders.app, faked: a JSON file of reminders that applies the ops keyvault sends and
+# answers the way the real script does. Every call is logged.
+
+cat > "$T/reminders" <<'PY'
+#!/usr/bin/env python3
+import json, os, re, sys
+state, log = os.environ["FAKE_REMINDERS"], os.environ["FAKE_REMINDERS"] + ".log"
+if os.environ.get("FAKE_REMINDERS_FAIL"):
+    sys.exit(1)
+req = json.loads(sys.argv[1])
+rs = json.load(open(state)) if os.path.exists(state) else []
+open(log, "a").write(json.dumps(req["ops"]) + "\n")
+for op in req["ops"]:
+    if op["op"] == "create":
+        rs.append({"rid": "r%d" % (len(rs) + 100), "name": op["name"], "body": op["body"], "due": op["due"], "completed": False})
+    for r in rs:
+        if r["rid"] == op.get("rid"):
+            if op["op"] == "delete": r["deleted"] = True
+            else: r.update(name=op["name"], body=op["body"], due=op["due"], completed=False)
+rs = [r for r in rs if not r.get("deleted")]
+json.dump(rs, open(state, "w"))
+out = []
+for r in rs:
+    m = re.search(r"\[keyvault:(.+)\|(\d{4}-\d{2}-\d{2})\]\s*$", r["body"])
+    if m: out.append({"rid": r["rid"], "id": m.group(1), "expires": m.group(2), "completed": r["completed"]})
+print(json.dumps(out))
+PY
+chmod +x "$T/reminders"
+export KEYVAULT_REMINDERS_BIN="$T/reminders" FAKE_REMINDERS="$T/reminders.json"
+rem()   { jq -c "$1" "$FAKE_REMINDERS"; }
+calls() { wc -l < "$FAKE_REMINDERS.log" 2>/dev/null | tr -d ' ' || echo 0; }
+printf '[{"rid":"mine","name":"Buy milk","body":"not keyvault","due":"2026-01-21","completed":false}]' > "$FAKE_REMINDERS"
+
+group "Reminders: off until asked, then kept in step"
+tkv secret expires EXP_TOKEN 2026-03-01 >/dev/null 2>&1
+[[ -e $FAKE_REMINDERS.log ]] && no "nothing touches Reminders before 'keyvault remind'" || ok "nothing touches Reminders before 'keyvault remind'"
+out="$(tkv remind 2>&1)"; rc=$?
+check "remind exits 0" "$rc" "0"
+check "one reminder per dated item ahead" "$(rem '[.[] | select(.body | test("keyvault:"))] | map(.name) | sort | join(" / ")')" \
+    '"Renew EXP_TOKEN — expires 2026-03-01 / Renew REQ_TOKEN — expires 2026-06-01 / Renew TYPED_TOKEN — expires 2026-03-06"'
+check "due 14 days before" "$(rem '.[] | select(.name | test("EXP_TOKEN")) | .due')" '"2026-02-15"'
+rem '.[] | select(.name | test("EXP_TOKEN")) | .body' | grep -q 'keyvault secret set EXP_TOKEN --expires' \
+    && ok "saying how to renew it" || no "saying how to renew it" "$(rem .)"
+check "a reminder that is not keyvault's is left alone" "$(rem '.[] | select(.rid=="mine") | .name')" '"Buy milk"'
+n="$(calls)"; tkv secret set SOME_USER --plain someone --desc "not dated" >/dev/null 2>&1
+check "a catalog change that moves no date calls nothing" "$(calls)" "$n"
+jq '(.[] | select(.name | test("EXP_TOKEN")) | .completed) = true' "$FAKE_REMINDERS" > "$FAKE_REMINDERS.t" && mv "$FAKE_REMINDERS.t" "$FAKE_REMINDERS"
+tkv secret expires EXP_TOKEN 2026-04-01 >/dev/null 2>&1
+check "a new date moves its reminder" "$(rem '[.[] | select(.name | test("EXP_TOKEN"))] | map(.due) | join(",")')" '"2026-03-18"'
+check "and reopens it if it was ticked off" "$(rem '.[] | select(.name | test("EXP_TOKEN")) | .completed')" "false"
+printf 'x' | tkv secret set SOON_TOKEN --stdin --desc soon --expires 2026-01-25 >/dev/null 2>&1
+check "one due sooner than 14 days is due today" "$(rem '.[] | select(.name | test("SOON_TOKEN")) | .due')" '"2026-01-20"'
+printf 'x' | tkv secret set PAST_TOKEN --stdin --desc past --expires 2026-01-01 >/dev/null 2>&1
+rem 'any(.[]; .name | test("PAST_TOKEN"))' | grep -q true && no "a date already past gets none" || ok "a date already past gets none"
+tkv secret rm SOON_TOKEN >/dev/null 2>&1
+rem 'any(.[]; .name | test("SOON_TOKEN"))' | grep -q true && no "removing the token removes its reminder" || ok "removing the token removes its reminder"
+jq '. + [.[] | select(.name | test("REQ_TOKEN")) | .rid = "dup"]' "$FAKE_REMINDERS" > "$FAKE_REMINDERS.t" && mv "$FAKE_REMINDERS.t" "$FAKE_REMINDERS"
+tkv remind >/dev/null 2>&1
+check "a duplicate collapses to one" "$(rem '[.[] | select(.name | test("REQ_TOKEN"))] | length')" "1"
+# A catalog written by hand, or by an older keyvault, with a date that is not one.
+jq '(.items[] | select(.id == "secret-REQ_TOKEN") | .meta.expires) = "next spring"' "$T/dest/catalog.json" > "$T/c.json" && mv "$T/c.json" "$T/dest/catalog.json"
+tkv remind >/dev/null 2>&1
+check "an unreadable date keeps its reminder" "$(rem '[.[] | select(.name | test("REQ_TOKEN"))] | length')" "1"
+check "and every other one" "$(rem '[.[] | select(.name | test("EXP_TOKEN|TYPED_TOKEN"))] | length')" "2"
+out="$(tkv expiring 2>&1)"; rc=$?
+check "expiring flags it (exit 2)" "$rc" "2"
+grep -qE 'unreadable date +token +REQ_TOKEN' <<<"$out" && grep -q '"next spring", is not a date' <<<"$out" \
+    && ok "saying what it said" || no "saying what it said" "$out"
+grep -q EXP_TOKEN <<<"$out" && ok "and still lists the rest" || no "and still lists the rest" "$out"
+grep -q '^REQ_TOKEN ' <<<"$(tkv catalog 2>&1)" && ok "the catalog still lists it" || no "the catalog still lists it"
+out="$(tkv describe REQ_TOKEN 2>&1)"
+grep -q 'jq: error' <<<"$out" && no "describe does not choke on it" "$out" || ok "describe does not choke on it"
+printf 'x' | tkv secret set REQ_TOKEN --stdin --desc "requested" >/dev/null 2>&1
+check "a replacement does not inherit it: its backup still works" "$(jq -r '.items[] | select(.id=="secret-REQ_TOKEN") | .meta.expires // "none"' "$T/dest/catalog.json")" "none"
+tkv secret expires REQ_TOKEN 2026-06-01 >/dev/null 2>&1
+printf '{broken' > "$T/c.json"; cp "$T/dest/catalog.json" "$T/c.good"; mv "$T/c.json" "$T/dest/catalog.json"
+n="$(calls)"; tkv remind >/dev/null 2>&1; rc=$?
+[[ $rc != 0 && $(calls) == "$n" ]] && ok "an unreadable catalog is an error, not an empty list to sync" || no "an unreadable catalog is an error, not an empty list to sync" "rc=$rc calls $n -> $(calls)"
+mv "$T/c.good" "$T/dest/catalog.json"
+# A failed update is not retried by a read: expiring asks for nothing, it only says so.
+FAKE_REMINDERS_FAIL=1 tkv secret expires EXP_TOKEN 2026-04-15 >/dev/null 2>&1
+n="$(calls)"; out="$(tkv expiring 2>&1)"
+check "expiring never writes to Reminders" "$(calls)" "$n"
+grep -q 'behind the vault' <<<"$out" && ok "it says Reminders is behind" || no "it says Reminders is behind" "$out"
+grep -q 'behind the vault' <<<"$(tkv doctor 2>&1)" && ok "so does doctor" || no "so does doctor"
+tkv remind >/dev/null 2>&1
+check "remind catches up" "$(rem '.[] | select(.name | test("EXP_TOKEN")) | .due')" '"2026-04-01"'
+# Keychain identities: an Apple Development certificate is Xcode's to renew, a distribution
+# one is yours. Only yours gets a reminder, or counts as due.
+jq '.items += [{id: "identities-test", type: "identities", kind: "codesign-identities", certs: [
+      {name: "Apple Development: Test Person (AAAAAAAAAA)", sha1: "1111111111111111111111111111111111111111", not_after: "Feb  1 12:00:00 2026 GMT"},
+      {name: "Apple Distribution: Test Co (BBBBBBBBBB)", sha1: "2222222222222222222222222222222222222222", not_after: "Mar  1 12:00:00 2026 GMT"}]}]' \
+    "$T/dest/catalog.json" > "$T/c.json" && mv "$T/c.json" "$T/dest/catalog.json"
+tkv remind >/dev/null 2>&1
+check "a distribution certificate gets a reminder" "$(rem '[.[] | select(.name | test("Apple Distribution: Test Co"))] | length')" "1"
+check "a development one does not: Xcode renews it" "$(rem '[.[] | select(.name | test("Apple Development"))] | length')" "0"
+out="$(tkv expiring 2>&1)"
+grep -q 'Apple Development: Test Person (AAAAAAAAAA)  (Xcode renews it)' <<<"$out" && ok "expiring still lists it, as Xcode's" || no "expiring still lists it, as Xcode's" "$out"
+sed -n '/To renew/,$p' <<<"$out" | grep -q 'Apple Development' && no "and never as one to renew, 12 days out or not" "$out" || ok "and never as one to renew, 12 days out or not"
+jq 'del(.items[] | select(.id == "identities-test"))' "$T/dest/catalog.json" > "$T/c.json" && mv "$T/c.json" "$T/dest/catalog.json"
+tkv remind >/dev/null 2>&1
+out="$(FAKE_REMINDERS_FAIL=1 tkv remind 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q 'Automation' <<<"$out" && ok "an unreachable Reminders says where to allow it" || no "an unreachable Reminders says where to allow it" "$out"
+grep -q 'reminders on' <<<"$(tkv doctor 2>&1)" && ok "doctor says reminders are on" || no "doctor says reminders are on"
+tkv remind off >/dev/null 2>&1; n="$(calls)"
+tkv secret expires EXP_TOKEN 2026-05-01 >/dev/null 2>&1
+check "after 'remind off' nothing is touched" "$(calls)" "$n"
+for t in EXP_TOKEN TYPED_TOKEN REQ_TOKEN PAST_TOKEN SOME_USER; do tkv secret rm "$t" >/dev/null 2>&1; done
+unset KEYVAULT_TODAY KEYVAULT_REMINDERS_BIN
+
+# ---------------------------------------------------------------------------- scan
+#
+# A home folder of its own, seeded with made-up tokens. Each is random, so gitleaks takes
+# it for real, and built here, so this file holds none.
+
+H="$WORK/scanhome"
+tok() { printf '%s%s' "$1" "$(head -c 300 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c "$2")"; }
+mkdir -p "$H/Documents" "$H/code/app" "$H/code/app/node_modules/dep" "$H/.config/tool" "$H/.claude/projects/p" \
+         "$H/Library/Caches/x" "$H/Library/Mobile Documents/com~apple~CloudDocs/Notes" "$H/keys"
+T_LOOSE="$(tok ghp_ 36)"; T_REPO="$(tok ghp_ 36)"; T_ENV="$(tok ghp_ 36)"; T_TOOL="$(tok ghp_ 36)"
+T_CHAT="$(tok ghp_ 36)"; T_CACHE="$(tok ghp_ 36)"; T_CLOUD="$(tok ghp_ 36)"; T_DEP="$(tok ghp_ 36)"
+printf 'github: %s\n' "$T_LOOSE" > "$H/Documents/notes.txt"
+printf 'a line\nconst token = "%s";\n' "$T_REPO" > "$H/code/app/client.js"
+(cd "$H/code/app" && git init -q && git add client.js && git -c user.email=t@example.com -c user.name=t commit -qm init)
+printf 'GITHUB_TOKEN=%s\n' "$T_ENV" > "$H/code/app/.env"
+printf 'oauth_token: %s\n' "$T_TOOL" > "$H/.config/tool/hosts.yml"
+printf '{"text":"use %s"}\n' "$T_CHAT" > "$H/.claude/projects/p/chat.jsonl"
+printf '%s\n' "$T_CACHE" > "$H/Library/Caches/x/cached.txt"
+printf 'token %s\n' "$T_CLOUD" > "$H/Library/Mobile Documents/com~apple~CloudDocs/Notes/cloud.txt"
+printf 'GITHUB_TOKEN=%s\n' "$T_DEP" > "$H/code/app/node_modules/dep/.env"
+openssl genrsa -out "$H/keys/deploy.pem" 2048 2>/dev/null
+skv() { tenv HOME="$H" "${NOTTY[@]}" "$SHELL_BIN" "$KV" "$@"; }
+skv add deploy-key --file "$H/keys/deploy.pem" --desc "deploy key" >/dev/null 2>&1
+
+group "scan: finds them, says what each one means, shows none"
+out="$(skv scan 2>&1)"; rc=$?
+check "scan exits 2 when it finds something" "$rc" "2"
+leaked=""; for v in "$T_LOOSE" "$T_REPO" "$T_ENV" "$T_TOOL" "$T_CHAT" "$T_CACHE" "$T_CLOUD" "$T_DEP"; do
+    grep -qF "$v" <<<"$out" && leaked=1; done
+[[ -z $leaked ]] && ok "no value is ever printed" || no "no value is ever printed" "$out"
+J="$(skv scan --json 2>/dev/null)"
+cat_of() { jq -r --arg f "$1" '[.findings[] | select(.file == $f) | .category] | unique | join(",")' <<<"$J"; }
+check "a token committed to git" "$(cat_of '~/code/app/client.js')" "committed"
+check "is found on its line" "$(jq -r '.findings[] | select(.file == "~/code/app/client.js") | .line' <<<"$J")" "2"
+check "a .env git does not track is lying around" "$(cat_of '~/code/app/.env')" "loose"
+check "so is a note in Documents" "$(cat_of '~/Documents/notes.txt')" "loose"
+check "and one in iCloud Drive" "$(cat_of '~/Library/Mobile Documents/com~apple~CloudDocs/Notes/cloud.txt')" "loose"
+check "a tool's own config is where a tool reads it" "$(cat_of '~/.config/tool/hosts.yml')" "tool"
+check "a key keyvault holds is where it belongs" "$(cat_of '~/keys/deploy.pem')" "vault"
+check "the rest of ~/Library is skipped" "$(cat_of '~/Library/Caches/x/cached.txt')" ""
+check "so is node_modules" "$(cat_of '~/code/app/node_modules/dep/.env')" ""
+check "and, unless asked, agents' conversations" "$(cat_of '~/.claude/projects/p/chat.jsonl')" ""
+grep -q 'scan --transcripts' <<<"$out" && ok "saying how to include them" || no "saying how to include them" "$out"
+J="$(skv scan --transcripts --json 2>/dev/null)"
+check "--transcripts: seen by an agent" "$(cat_of '~/.claude/projects/p/chat.jsonl')" "agent"
+grep -q 'COMMITTED TO GIT' <<<"$out" && grep -q 'Rotate it' <<<"$out" && ok "the report says what to do" || no "the report says what to do" "$out"
+grep -q 'no such file' <<<"$(skv scan "$H/nope" 2>&1)" && ok "a missing path is refused" || no "a missing path is refused"
+mkdir -p "$H/empty"; printf 'nothing here\n' > "$H/empty/readme.txt"
+out="$(skv scan "$H/empty" 2>&1)"; rc=$?
+check "a clean folder exits 0" "$rc" "0"
+grep -q 'no keys or tokens found' <<<"$out" && ok "and says so" || no "and says so" "$out"
+
+# A repository someone else made: its .git/config may name a program for git to run.
+mkdir -p "$H/Downloads/cloned"
+(cd "$H/Downloads/cloned" && git init -q && printf 'k = "%s"\n' "$(tok ghp_ 36)" > a.js && git add a.js \
+    && git -c user.email=t@example.com -c user.name=t commit -qm x && git config core.fsmonitor "touch $WORK/FSMONITOR-RAN; false")
+check "and in a downloaded repo" "$(skv scan "$H/Downloads/cloned" --json 2>/dev/null | jq -r '.findings[0].category')" "committed"
+[[ -e $WORK/FSMONITOR-RAN ]] && no "without running a program its .git/config names" || ok "without running a program its .git/config names"
+rm -rf "$H/Downloads/cloned"
+# The vault's folder often holds plaintext keys too. Only keyvault's own files are its own.
+printf 'token %s\n' "$(tok ghp_ 36)" > "$T/dest/stray-note.txt"
+J2="$(skv scan "$T/dest" --json 2>/dev/null)"
+check "a plaintext key beside the vault is lying around" "$(jq -r '.findings[] | select(.file | endswith("/stray-note.txt")) | .category' <<<"$J2")" "loose"
+check "keyvault's own files there are not findings" "$(jq -r '[.findings[] | select(.category != "vault" and (.file | endswith("/stray-note.txt") | not))] | length' <<<"$J2")" "0"
+rm -f "$T/dest/stray-note.txt"
+skv scan "$H/.config" >/dev/null 2>&1
+check "a tool's own config alone exits 0: it is where it belongs" "$?" "0"
+grep -q 'scan --transcripts' <<<"$(skv scan "$H/Documents" 2>&1)" && no "the conversation-log note only shows when home was scanned" || ok "the conversation-log note only shows when home was scanned"
+
+group "scan ignore: a finding, or a whole folder"
+fp="$(jq -r '.findings[] | select(.file == "~/Documents/notes.txt") | .fingerprint' <<<"$J")"
+skv scan ignore "$fp" >/dev/null 2>&1
+J="$(skv scan --json 2>/dev/null)"
+check "an ignored finding is gone" "$(cat_of '~/Documents/notes.txt')" ""
+check "and counted as ignored" "$(jq -r '.stats.ignored' <<<"$J")" "1"
+grep -q 'already ignored' <<<"$(skv scan ignore "$fp" 2>&1)" && ok "ignoring twice writes it once" || no "ignoring twice writes it once"
+skv scan ignore "$H/code" >/dev/null 2>&1
+J="$(skv scan --json 2>/dev/null)"
+check "an ignored folder hides all it holds" "$(jq -r '[.findings[] | select(.file | startswith("~/code/"))] | length' <<<"$J")" "0"
+grep -q '^~/code ' "$(dirname "$T/keyvault.conf")/scan-ignore" && ok "written as ~/…, portable" || no "written as ~/…, portable" "$(cat "$(dirname "$T/keyvault.conf")/scan-ignore")"
+out="$(tenv HOME="$H" PATH=/usr/bin:/bin "${NOTTY[@]}" "$SHELL_BIN" "$KV" scan 2>&1)"
+grep -q 'brew install gitleaks' <<<"$out" && ok "without gitleaks it says how to get it" || no "without gitleaks it says how to get it" "$out"
+
+group "scan: one line per place, one finding per repository"
+# A folder of captures, a worktree of a repo: noise that once buried the one key that mattered.
+mkdir -p "$H/Downloads/captures"
+for i in 1 2 3; do printf 'Authorization: token %s\n' "$(tok ghp_ 36)" > "$H/Downloads/captures/r$i.txt"; done
+(cd "$H/code/app" && git -c user.email=t@example.com -c user.name=t worktree add -q "$H/code/app-wt" 2>/dev/null)
+rm -f "$(dirname "$T/keyvault.conf")/scan-ignore"
+J="$(skv scan --json 2>/dev/null)"
+check "a committed line in two worktrees is one finding" \
+    "$(jq -r '[.findings[] | select(.category == "committed")] | length' <<<"$J")" "1"
+check "counted, and named by the main checkout" \
+    "$(jq -r '.findings[] | select(.category == "committed") | "\(.worktrees) \(.file)"' <<<"$J")" "2 ~/code/app/client.js"
+check "files in one folder share a place" "$(jq -r '[.findings[] | select(.file | startswith("~/Downloads/")) | .place] | unique | join(",")' <<<"$J")" "~/Downloads/captures"
+out="$(skv scan 2>&1)"
+grep -q '~/Downloads/captures/  (3 files)' <<<"$out" && ok "and are one line of the report" || no "and are one line of the report" "$out"
+grep -q 'the same in 2 worktrees' <<<"$out" && ok "which says a committed one is in both worktrees" || no "which says a committed one is in both worktrees" "$out"
+skv scan ignore "$H/Downloads/captures" >/dev/null 2>&1
+jq -e 'any(.findings[]; .place == "~/Downloads/captures")' <<<"$(skv scan --json 2>/dev/null)" >/dev/null \
+    && no "one ignore silences the place" || ok "one ignore silences the place"
+skv scan ignore "$H/code/app" >/dev/null 2>&1
+check "ignoring the checkout ignores its worktrees' copies too" \
+    "$(skv scan --json 2>/dev/null | jq -r '[.findings[] | select(.category == "committed")] | length')" "0"
+
+group "a running keyvault never reads past its last line"
+# Installed as a link into a checkout, the file can change under a long scan (git pull);
+# bash would then read on from the old offset into the new text. Nothing after main may run.
+mkdir -p "$WORK/copy"; cp "$KV" "$ROOT/keyvault-access.sh" "$ROOT/keyvault-scan.py" "$WORK/copy/"
+printf 'echo RAN-PAST-MAIN\n' >> "$WORK/copy/keyvault"
+out="$("$SHELL_BIN" "$WORK/copy/keyvault" version 2>&1)"; rc=$?
+grep -q RAN-PAST-MAIN <<<"$out" && no "the command's own exit ends the script" "$out" || ok "the command's own exit ends the script"
+check "with the command's status" "$rc" "0"
+"$SHELL_BIN" "$WORK/copy/keyvault" nope >/dev/null 2>&1
+check "a failing one's too" "$?" "1"
+
+# ---------------------------------------------------------------------------- checkup, schedule
+
+group "checkup: what needs doing, and only what is new"
+printf '#!/bin/bash\nprintf "%%s\\n" "$1" >> "%s/notified"\n' "$WORK" > "$WORK/notify"; chmod +x "$WORK/notify"
+ck() { tenv HOME="$H" KEYVAULT_NOTIFY_BIN="$WORK/notify" "${NOTTY[@]}" "$SHELL_BIN" "$KV" checkup "$@"; }
+rm -f "$T/state/checkup.json" "$WORK/notified"
+out="$(ck --notify 2>&1)"; rc=$?
+check "the first checkup exits 0: what is already there is not news" "$rc" "0"
+grep -q 'findings recorded' <<<"$out" && ok "it records what it found" || no "it records what it found" "$out"
+[[ -e $WORK/notified ]] && no "and notifies nobody" || ok "and notifies nobody"
+jq -e '.known | length > 0' "$T/state/checkup.json" >/dev/null && ok "file and rule, per finding" || no "file and rule, per finding"
+check "kept private" "$(stat -f '%Lp' "$T/state/checkup.json")" "600"
+printf 'deploy: %s\n' "$(tok ghp_ 36)" > "$H/Documents/new-note.txt"
+out="$(ck --notify 2>&1)"; rc=$?
+check "a key new since then exits 2" "$rc" "2"
+grep -q '1 new key in files' <<<"$out" && grep -q '~/Documents/new-note.txt  github-pat' <<<"$out" && ok "naming its file" || no "naming its file" "$out"
+grep -q '1 new in files' "$WORK/notified" 2>/dev/null && ok "--notify tells you" || no "--notify tells you" "$(cat "$WORK/notified" 2>&1)"
+printf 'a new first line\n' | cat - "$H/Documents/new-note.txt" > "$WORK/n" && mv "$WORK/n" "$H/Documents/new-note.txt"
+rm -f "$WORK/notified"; ck --notify >/dev/null 2>&1
+check "next time it is known, even moved down a line" "$?" "0"
+[[ -e $WORK/notified ]] && no "and nobody is notified" || ok "and nobody is notified"
+printf 'x' | skv secret set CHK_TOKEN --stdin --desc "due soon" --expires 10d >/dev/null 2>&1
+out="$(ck --no-scan 2>&1)"; rc=$?
+check "a date due within 30 days is to do" "$rc" "2"
+grep -q 'CHK_TOKEN' <<<"$out" && ok "by name" || no "by name" "$out"
+skv secret rm CHK_TOKEN >/dev/null 2>&1
+mkdir -p "$H/Documents/private"; printf 'x\n' > "$H/Documents/private/a.txt"; chmod 000 "$H/Documents/private"
+out="$(skv scan "$H/Documents" 2>&1)"
+chmod 700 "$H/Documents/private"
+grep -q '1 folder could not be read: ~/Documents/private' <<<"$out" && ok "a folder it may not read is said, not skipped" || no "a folder it may not read is said, not skipped" "$out"
+
+group "schedule: the checkup, weekly, through launchd"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/launchctl.log"\n' "$WORK" > "$WORK/launchctl"; chmod +x "$WORK/launchctl"
+sch() { tenv KEYVAULT_LAUNCHCTL="$WORK/launchctl" KEYVAULT_LAUNCH_AGENTS="$WORK/LaunchAgents" "${NOTTY[@]}" "$SHELL_BIN" "$KV" schedule "$@"; }
+PL="$WORK/LaunchAgents/keyvault.checkup.plist"
+grep -q 'off' <<<"$(sch status 2>&1)" && ok "off until turned on" || no "off until turned on"
+out="$(sch on 2>&1)"; rc=$?
+check "schedule on exits 0" "$rc" "0"
+plutil -lint "$PL" >/dev/null 2>&1 && ok "writes a valid launchd plist" || no "writes a valid launchd plist" "$(cat "$PL" 2>&1)"
+check "that runs this checkout's checkup, notifying" "$(plutil -extract ProgramArguments json -o - "$PL" 2>/dev/null | jq -c .)" "[\"/bin/bash\",\"$ROOT/keyvault\",\"checkup\",\"--notify\"]"
+check "on Mondays at 10:00" "$(plutil -extract StartCalendarInterval json -o - "$PL" 2>/dev/null | jq -c .)" '{"Hour":10,"Minute":0,"Weekday":1}'
+check "with this config" "$(plutil -extract EnvironmentVariables.KEYVAULT_CONF raw -o - "$PL" 2>/dev/null)" "$T/keyvault.conf"
+[[ -n $(plutil -extract EnvironmentVariables.PATH raw -o - "$PL" 2>/dev/null) ]] && ok "and the PATH its tools were found on" || no "and the PATH its tools were found on"
+grep -q "^bootstrap gui/$(id -u) $PL$" "$WORK/launchctl.log" && ok "and loads it" || no "and loads it" "$(cat "$WORK/launchctl.log")"
+grep -q '^on' <<<"$(sch status 2>&1 | sed 's/^ *✓ //')" && ok "status says it is on" || no "status says it is on" "$(sch status 2>&1)"
+sch on >/dev/null 2>&1
+grep -c "^bootout gui/$(id -u)/keyvault.checkup$" "$WORK/launchctl.log" | grep -q '^2$' && ok "turning it on again replaces it" || no "turning it on again replaces it" "$(cat "$WORK/launchctl.log")"
+sch off >/dev/null 2>&1
+[[ -e $PL ]] && no "off removes it" || ok "off removes it"
+grep -q 'off' <<<"$(sch status 2>&1)" && ok "and status says so" || no "and status says so"
 
 # ---------------------------------------------------------------------------- ramdisk
 
