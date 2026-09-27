@@ -1440,6 +1440,7 @@ check "schedule on exits 0" "$rc" "0"
 plutil -lint "$PL" >/dev/null 2>&1 && ok "writes a valid launchd plist" || no "writes a valid launchd plist" "$(cat "$PL" 2>&1)"
 check "that runs this checkout's checkup, notifying" "$(plutil -extract ProgramArguments json -o - "$PL" 2>/dev/null | jq -c .)" "[\"/bin/bash\",\"$ROOT/keyvault\",\"checkup\",\"--notify\"]"
 check "on Mondays at 10:00" "$(plutil -extract StartCalendarInterval json -o - "$PL" 2>/dev/null | jq -c .)" '{"Hour":10,"Minute":0,"Weekday":1}'
+check "niced, not throttled to a crawl as Background" "$(plutil -extract ProcessType raw -o - "$PL" 2>/dev/null) $(plutil -extract Nice raw -o - "$PL" 2>/dev/null)" "Standard 10"
 check "with this config" "$(plutil -extract EnvironmentVariables.KEYVAULT_CONF raw -o - "$PL" 2>/dev/null)" "$T/keyvault.conf"
 [[ -n $(plutil -extract EnvironmentVariables.PATH raw -o - "$PL" 2>/dev/null) ]] && ok "and the PATH its tools were found on" || no "and the PATH its tools were found on"
 grep -q "^bootstrap gui/$(id -u) $PL$" "$WORK/launchctl.log" && ok "and loads it" || no "and loads it" "$(cat "$WORK/launchctl.log")"

@@ -287,6 +287,8 @@ AS
 # The checkup as a launchd agent: Mondays at 10:00, or at the next wake if the Mac was
 # asleep. It runs this checkout's keyvault (git pull updates it) under stock /bin/bash, with
 # the PATH it was scheduled from, so gitleaks, jq and age are found where they were then.
+# Niced, with low-priority disk access, but not ProcessType Background: that throttles the
+# scan to a few percent of one core, and ten minutes of work took hours.
 
 launchctl_() { if [[ -n ${KEYVAULT_LAUNCHCTL:-} ]]; then "$KEYVAULT_LAUNCHCTL" "$@"; else launchctl "$@"; fi; }   # tests fake it
 
@@ -318,7 +320,7 @@ plist = {
     "StartCalendarInterval": {"Weekday": 1, "Hour": 10, "Minute": 0},
     "EnvironmentVariables": json.loads(env),
     "StandardOutPath": log, "StandardErrorPath": log,
-    "ProcessType": "Background", "LowPriorityIO": True, "Nice": 10,
+    "ProcessType": "Standard", "LowPriorityIO": True, "Nice": 10,
 }
 with open(path, "wb") as f:
     plistlib.dump(plist, f)
