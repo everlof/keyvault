@@ -300,6 +300,7 @@ parse_loan_args() {   # sets LOAN_IDS[], LOAN_REASON, LOAN_TTL, LOAN_RUN[]
         case "$1" in
             --reason) LOAN_REASON="$2"; shift 2 ;;
             --ttl)    LOAN_TTL="$2"; shift 2 ;;
+            --via)    KV_VIA="$2"; shift 2 ;;
             --run)    shift; [[ ${1:-} == -- ]] && shift
                       (($#)) || die "--run wants a command: --run -- <command…>"
                       LOAN_RUN=("$@"); break ;;
@@ -316,6 +317,13 @@ cmd_request() {
     have jq || die "jq is not installed"
     parse_loan_args "$@"
     local gid; gid="$(grant_record "$LOAN_REASON" "$LOAN_TTL" "${LOAN_IDS[@]}")" || exit 1
+
+    # With Face ID approvals the phone is where the person decides: ask it now.
+    if [[ $KV_VIA == iphone ]]; then
+        say "Request $gid: asking the user's iPhone."
+        approve_one "$gid" "$LOAN_TTL"
+        return
+    fi
 
     if [[ ${KEYVAULT_NO_NOTIFY:-0} != 1 ]] && have osascript; then
         osascript -e "display notification \"$(printf '%s' "$LOAN_REASON" | tr -d '"\\')\" with title \"keyvault: $gid wants ${#LOAN_IDS[@]} key(s)\"" >/dev/null 2>&1 &
@@ -545,24 +553,55 @@ approve_one() {   # approve_one <gid> [ttl-override]
         levels="$levels $lv"
         say "  item    $id  [$lv]  $(dim "$(jq -r --arg id "$id" '.items[] | select(.id == $id) | .desc // ""' "$KV_CATALOG")")"
     done
-    local asks=""
-    case "$levels" in *both*|*biometric*) asks="Touch ID" ;; esac
-    case "$levels" in *both*|*passphrase*) asks="${asks:+$asks and }your passphrase" ;; esac
-    [[ -n $asks ]] && say "  unlock  $asks"
-    if ! confirm_tty "Grant this?"; then
-        grant_drop "$gid" denied
-        say "denied"
-        return 1
+    ask_for_phone "$gid" "$ttl" "$oneshot"
+    if [[ $KV_VIA == iphone ]]; then
+        # The phone shows this same request and Face ID is the answer; a passphrase is not
+        # something a phone can supply.
+        case "$levels" in
+            *both*|*passphrase*) die "$gid includes items that need the passphrase — approve it at the Mac: keyvault approve $gid" ;;
+        esac
+        say "  unlock  Face ID on the iPhone, which shows this request"
+    else
+        local asks=""
+        case "$levels" in *both*|*biometric*) asks="Touch ID" ;; esac
+        case "$levels" in *both*|*passphrase*) asks="${asks:+$asks and }your passphrase" ;; esac
+        [[ -n $asks ]] && say "  unlock  $asks"
+        if ! confirm_tty "Grant this?"; then
+            grant_drop "$gid" denied
+            say "denied"
+            return 1
+        fi
     fi
     printf '%s\n' "$REC" > "$(grant_file "$gid")"     # the record is now what was approved
     if (( oneshot )); then
-        audit "approve $gid once"
+        audit "approve $gid once via=${KV_VIA:-mac}"
         grant_run_once "$gid" || { grant_drop "$gid" failed; die "run failed"; }
         return 0
     fi
     grant_materialize "$gid" "$ttl" || { grant_drop "$gid" failed; die "grant failed"; }
-    audit "approve $gid ttl=$ttl"
+    audit "approve $gid ttl=$ttl via=${KV_VIA:-mac}"
     ok "$gid active until $(grant_get "$gid" expires_at) — tell the agent it can proceed"
+}
+
+# What the phone shows for a grant: the same facts the terminal does, bounded to what the
+# request may carry.
+ask_for_phone() {   # ask_for_phone <gid> <ttl> <oneshot>
+    local gid="$1" ttl="$2" oneshot="$3" id
+    KV_ASK_TITLE="Approve $gid"
+    KV_ASK_LINES=()
+    ask_line "reason: $(rec reason)"
+    if (( oneshot )); then
+        ask_line "runs: $(printf '%q ' "${RUN_ARGV[@]}")"
+        ask_line "in: $(rec cwd)"
+    else
+        ask_line "for: $(human_duration "$ttl")"
+    fi
+    for id in $(jq -r '.items[]' <<<"$REC"); do ask_line "item: $id"; done
+    ask_line "asked by: $(rec requested_by)"
+}
+ask_line() {
+    (( ${#KV_ASK_LINES[@]} < 12 )) || return 0
+    KV_ASK_LINES+=("$(printf '%s' "$1" | tr '\n\t' '  ' | LC_ALL=C cut -c1-200)")
 }
 
 cmd_approve() {
@@ -575,7 +614,7 @@ cmd_approve() {
             *)     gid="$1"; shift ;;
         esac
     done
-    require_human approve
+    [[ $KV_VIA == iphone ]] || require_human approve     # else the phone is where the person decides
     grants_sweep
     if [[ -z $gid ]]; then
         # No id: walk every pending request, oldest first.

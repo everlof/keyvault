@@ -262,6 +262,7 @@ factor_unlock() {   # factor_unlock <biometric|passphrase|recovery>
     [[ -s $out ]] && return 0
     case "$f" in
         biometric)
+            if [[ $KV_VIA == iphone ]]; then factor_unlock_iphone "$out"; return 0; fi
             local wrap="$KV_KEYS/biometric.$KV_VIA.age" id="${KEYVAULT_SE_IDENTITY:-$KV_KEYS/biometric.$KV_VIA.identity}"
             [[ -f $wrap ]] || die "no biometric key for '$KV_VIA' — run 'keyvault setup'"
             [[ -n ${KEYVAULT_SE_IDENTITY:-} ]] || info "  ${C_BOLD}Touch ID${C_RESET} to unlock the biometric key ($KV_VIA)"
@@ -302,6 +303,93 @@ factor_unlock() {   # factor_unlock <biometric|passphrase|recovery>
             fi
             ;;
     esac
+}
+
+# ---------------------------------------------------------------------------- iPhone
+#
+# The biometric key, opened by a paired iPhone's Face ID instead of this Mac's Touch ID.
+# Threading carries it: `device add iphone` has it seal the key to the phone's Secure Enclave
+# once (keys/biometric.iphone.envelope, useless anywhere else), and `--via iphone` asks the
+# phone to open it, showing what is asked and which process asks. What comes back is checked
+# here, not trusted: anything but this vault's biometric key is refused. Restoring a machine
+# never needs any of this.
+#
+# The key only ever crosses a pipe or a variable here: a bash 3.2 here-string is a temp file.
+
+readonly KV_THREADING_SOCKET="${KEYVAULT_THREADING_SOCKET:-$HOME/Library/Application Support/Threading/approvals/approvals.sock}"
+KV_COMMAND=""       # the command being run, for the phone to show
+KV_ASK_TITLE=""     # what the phone shows; approve sets the grant being approved
+KV_ASK_LINES=()
+
+iphone_envelope() { printf '%s/biometric.iphone.envelope\n' "$KV_KEYS"; }
+
+threading_call() {   # threading_call <json-line> -> Threading's one-line reply
+    [[ -S $KV_THREADING_SOCKET ]] \
+        || die "Threading's Face ID approvals are off — Threading → Settings → Remote Access → Face ID Approvals"
+    have nc || die "nc is missing"
+    printf '%s\n' "$1" | nc -U "$KV_THREADING_SOCKET"
+}
+
+threading_refusal() {   # threading_refusal <reply> -> why, in words
+    case "$(printf '%s' "$1" | jq -r '.error // "refused"' 2>/dev/null)" in
+        denied)       echo "denied on the iPhone" ;;
+        expired)      echo "not approved in time — ask again" ;;
+        busy)         echo "the iPhone is still deciding on another request" ;;
+        disabled)     echo "Face ID approvals are off in Threading" ;;
+        not-enrolled) echo "no iPhone is enrolled in Threading → Remote Access → Face ID Approvals" ;;
+        wrong-device) echo "the iPhone was changed or forgotten — run 'keyvault device add iphone' again" ;;
+        *)            echo "Threading refused the request" ;;
+    esac
+}
+
+factor_unlock_iphone() {   # factor_unlock_iphone <out>
+    local out="$1" envelope lines request reply
+    envelope="$(iphone_envelope)"
+    [[ -f $envelope ]] || die "no iPhone opens the biometric key yet — run 'keyvault device add iphone'"
+    lines="$(printf '%s\n' ${KV_ASK_LINES[@]+"${KV_ASK_LINES[@]}"} | grep . | jq -R . | jq -sc .)"
+    request="$(jq -nc --arg t "${KV_ASK_TITLE:-keyvault ${KV_COMMAND:-}}" --argjson l "$lines" \
+        --slurpfile e "$envelope" '{op:"unwrap", client:"keyvault", title:$t, lines:$l, envelope:$e[0]}')"
+    info "  ${C_BOLD}iPhone${C_RESET}: approve it with Face ID in Threading → Settings → Face ID Approvals"
+    reply="$(threading_call "$request")" || die "could not reach Threading"
+    [[ "$(printf '%s' "$reply" | jq -r '.ok' 2>/dev/null)" == true ]] \
+        || die "the iPhone did not open the biometric key: $(threading_refusal "$reply")"
+    ( umask 077; printf '%s' "$reply" | jq -r '.secret' | base64 --decode > "$out" ) 2>/dev/null
+    reply=""
+    if [[ "$(age-keygen -y "$out" 2>/dev/null)" != "$(recipient_of biometric)" ]]; then
+        rm -f "$out"; die "what came back from the iPhone is not this vault's biometric key — refused"
+    fi
+}
+
+cmd_device() {   # device add|remove iphone
+    local action="${1:-}" name="${2:-}"
+    [[ $name == iphone && ( $action == add || $action == remove ) ]] || die "usage: keyvault device add|remove iphone"
+    if [[ $action == remove ]]; then
+        rm -f "$(iphone_envelope)"
+        ok "the iPhone no longer opens the biometric key (forget it in Threading too)"
+        return 0
+    fi
+    have jq || die "jq is not installed"
+    age_require
+    keys_require
+    local status fingerprint b64 reply
+    status="$(threading_call '{"op":"status"}')" || die "could not reach Threading"
+    [[ "$(printf '%s' "$status" | jq -r '.enabled')" == true ]] \
+        || die "turn on Face ID approvals in Threading → Settings → Remote Access first"
+    [[ "$(printf '%s' "$status" | jq -r '.enrolled')" == true ]] \
+        || die "enroll the iPhone first: Threading → Settings → Remote Access → Face ID Approvals → Enroll iPhone"
+    fingerprint="$(printf '%s' "$status" | jq -r '.fingerprint // "?"')"
+    ws_open
+    KV_VIA=mac
+    factor_unlock biometric                   # Touch ID, one last time for this
+    b64="$(base64 < "$(factor_path biometric)" | tr -d '\n')"
+    reply="$(threading_call "$(printf '{"op":"wrap","secret":"%s"}' "$b64")")" || die "could not reach Threading"
+    b64=""
+    [[ "$(printf '%s' "$reply" | jq -r '.ok')" == true ]] || die "Threading could not seal the key: $(threading_refusal "$reply")"
+    ( umask 077; printf '%s' "$reply" | jq -c '.envelope' > "$(iphone_envelope).new" ) \
+        && mv -f "$(iphone_envelope).new" "$(iphone_envelope)" || die "could not save the iPhone's envelope"
+    ok "the biometric key now also opens with Face ID on the iPhone"
+    note "its key is $fingerprint — it must match what the iPhone shows under Face ID Approvals"
+    note "use it with --via iphone, e.g. keyvault approve --via iphone"
 }
 
 # seal <level> <plaintext-file> <out> — one age layer per factor, each also to recovery.
@@ -1865,6 +1953,7 @@ cmd_status() {
         for d in "$KV_KEYS"/biometric.*.age; do
             [[ -f $d ]] && ok "biometric  $(basename "$d" .age | sed 's/^biometric\.//')"
         done
+        [[ -f $(iphone_envelope) ]] && ok "biometric  iphone (Face ID, through Threading)"
         [[ -f $KV_KEYS/passphrase.key.age ]] && ok "passphrase"
         ok "recovery   $(recipient_of recovery)  (the key itself is on paper)"
     else
@@ -2253,6 +2342,7 @@ ${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passph
   validate                    does it still match this machine?  (exit 2: out of date)
   card                        a printable recovery sheet
   recovery-check              is the key on your paper the right one?
+  device add|remove iphone    let a paired iPhone's Face ID open the biometric key, through Threading
 
 ${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
   add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
@@ -2273,7 +2363,7 @@ ${C_BOLD}PUTTING IT BACK${C_RESET}
   restore [--only ID] [--force] [--apply]     dry run unless --apply
 
   Reading commands accept --recovery (open with the paper key: a new Mac) and
-  --via DEVICE (which device unlocks the biometric key; default: mac).
+  --via DEVICE (which device unlocks the biometric key: mac, the default, or iphone).
 
 ${C_BOLD}FOR AGENTS — WHAT EXISTS (asks for nothing, no secrets)${C_RESET}
   catalog [--json]            every vault item and 'secret' token, with its level and public facts
@@ -2326,6 +2416,9 @@ ${C_BOLD}USE A KEY${C_RESET}  (LEVEL biometric, passphrase or both: only the use
         the user approves that exact command; it runs once. Then: keyvault result <grant>
   keyvault request <id>… --reason "…" [--ttl 30m]
         a loan. Tell the user to run 'keyvault approve <grant>', then wait.
+        Add --via iphone if the user approves with Face ID on their iPhone: the phone shows
+        the request and who asked, and the loan starts once they approve. Items that need the
+        passphrase still need them at the Mac.
         Then: keyvault exec <grant> -- <command…>   (\$KV_<ID> is the file's path)
         and:  keyvault revoke <grant>               as soon as you are done
 
@@ -2353,6 +2446,7 @@ EOF
 
 main() {
     local cmd="${1:-help}"; shift || true
+    KV_COMMAND="$cmd"
     case "$cmd" in
         pack)               cmd_pack "$@" ;;
         list|ls)            cmd_list "$@" ;;
@@ -2365,6 +2459,7 @@ main() {
         card)               cmd_card "$@" ;;
         setup)              cmd_setup "$@" ;;
         recovery-check)     cmd_recovery_check "$@" ;;
+        device)             cmd_device "$@" ;;
         secret)             cmd_secret "$@" ;;
         open|close|abort)   die "'$cmd' is gone in 2.0: writes never ask for anything any more, so there is no session to hold open" ;;
         status)             cmd_status ;;

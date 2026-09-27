@@ -92,6 +92,11 @@ you are running and why. Never use `secret get` in scripts, or print a value.
    copy, cat or echo key contents**, and never write them anywhere outside the grant.
 4. `keyvault revoke <grant>` as soon as the job is done. Don't leave it to expire.
 
+**If the user approves on their iPhone** (Face ID approvals in Threading), add `--via iphone`
+to the request. Their phone shows your reason, the items and who asked; the loan starts once
+they approve with Face ID, and you go on to `keyvault exec`. Items at `passphrase` or `both`
+still need them at the Mac.
+
 If the grant expired mid-job, file a new request. Don't ask for a longer TTL up front "just
 in case".
 

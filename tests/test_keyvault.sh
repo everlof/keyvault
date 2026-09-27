@@ -32,7 +32,7 @@ check_true() { if "$@"; then ok "$1"; else no "$1"; fi; } # unused guard, kept e
 # ---------------------------------------------------------------------------- fixture
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/keyvault-test.XXXXXX")"
-trap 'for k in ${IKC:-} ${TKC:-} ${TKC2:-}; do security delete-keychain "$k" 2>/dev/null; done; rm -rf "$WORK"; [[ -n ${MOUNT:-} ]] && rm -rf "$MOUNT" 2>/dev/null; true' EXIT
+trap '[[ -n ${FAKE_PID:-} ]] && kill "$FAKE_PID" 2>/dev/null; for k in ${IKC:-} ${TKC:-} ${TKC2:-}; do security delete-keychain "$k" 2>/dev/null; done; rm -rf "$WORK"; [[ -n ${MOUNT:-} ]] && rm -rf "$MOUNT" 2>/dev/null; true' EXIT
 
 mkdir -p "$WORK/src" "$WORK/globdir" "$WORK/dest" "$WORK/state"
 
@@ -1010,6 +1010,62 @@ grep -q 'nothing was entered' <<<"$out" && ok "an empty answer is refused" || no
 treq AGENT_NODESC >/dev/null 2>&1 && no "--desc is required" || ok "--desc is required"
 grep -q 'token-request AGENT_TOKEN by=.* stored ask' "$T/state/audit.log" && ok "requests are audited" || no "requests are audited" "$(cat "$T/state/audit.log" 2>&1)"
 check "a request never reads a token" "$(reads)" ""
+
+# ---------------------------------------------------------------------------- iPhone
+#
+# Face ID on a paired iPhone, through Threading. A stand-in socket plays Threading and the
+# phone; the real protocol and cryptography are tested in Threading's own suite. What this
+# proves is keyvault's half: it asks, shows the phone what is asked, and checks what comes back.
+
+group "iPhone: the biometric key opened with Face ID, beside Touch ID"
+F="$WORK/threading"; mkdir -p "$F"
+TSOCK="$F/t.sock"
+python3 "$ROOT/tests/fake_threading.py" "$TSOCK" "$F" &
+FAKE_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -S $TSOCK ]] && break; sleep 0.2; done
+phone() { printf '%s' "$1" > "$F/phone"; }
+asked() { jq -r "$1" "$F/asked.json" 2>/dev/null; }
+viaphone() { KEYVAULT_THREADING_SOCKET="$TSOCK" notty env -u KEYVAULT_SE_IDENTITY "$SHELL_BIN" "$KV" "$@"; }
+
+out="$(KEYVAULT_THREADING_SOCKET="$TSOCK" kv device add iphone 2>&1)"; rc=$?
+check "device add iphone exits 0" "$rc" "0"
+[[ -f $KEYVAULT_KEYS/biometric.iphone.envelope ]] && ok "the key is sealed for the phone" || no "the key is sealed for the phone" "$out"
+grep -q 'AGE-SECRET-KEY' "$KEYVAULT_KEYS/biometric.iphone.envelope" && no "the sealed file holds no key" || ok "the sealed file holds no key"
+grep -q 'TEST 0000 1111 2222' <<<"$out" && ok "it shows the phone's key to compare" || no "it shows the phone's key to compare" "$out"
+grep -q 'iphone' <<<"$(kv status 2>&1)" && ok "status lists the iPhone" || no "status lists the iPhone"
+
+phone approve
+check "show --via iphone opens a biometric item without Touch ID" "$(viaphone show beta --stdout --via iphone 2>/dev/null)" "PRIVATE-KEY-BETA"
+check "the phone is told what is asked" "$(asked .client)" "keyvault"
+grep -q 'show' <<<"$(asked .title)" && ok "and which command asks" || no "and which command asks" "$(asked .title)"
+phone deny
+out="$(viaphone show beta --stdout --via iphone 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q 'denied on the iPhone' <<<"$out" && ok "a denial opens nothing" || no "a denial opens nothing" "$out"
+age-keygen -o "$F/wrong.id" >/dev/null 2>&1; phone wrong
+out="$(viaphone show beta --stdout --via iphone 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q "not this vault's biometric key" <<<"$out" && ok "keyvault checks what comes back: another key is refused" \
+    || no "keyvault checks what comes back: another key is refused" "$out"
+phone approve
+
+out="$(viaphone request beta --reason "sign the release" --ttl 5m --via iphone 2>&1)"; rc=$?
+check "request --via iphone approves without a terminal" "$rc" "0"
+gid="$(grep -o 'kv-[a-f0-9]\{8\}' <<<"$out" | head -1)"
+check "the grant is active" "$(jq -r '.status' "$WORK/state/grants/$gid.json" 2>/dev/null)" "active"
+check "the phone shows the grant" "$(asked .title)" "Approve $gid"
+asked '.lines[]' | grep -q '^reason: sign the release$' && ok "its reason" || no "its reason" "$(asked .lines)"
+asked '.lines[]' | grep -q '^item: beta$' && ok "its items" || no "its items" "$(asked .lines)"
+asked '.lines[]' | grep -q '^asked by: ' && ok "and who asked" || no "and who asked" "$(asked .lines)"
+kv revoke "$gid" >/dev/null 2>&1
+out="$(viaphone request alpha --reason "needs both" --via iphone 2>&1)"; rc=$?
+[[ $rc != 0 ]] && grep -q 'need the passphrase' <<<"$out" && ok "a grant needing the passphrase is sent to the Mac" \
+    || no "a grant needing the passphrase is sent to the Mac" "$out"
+
+check "Touch ID still works beside it" "$(kv show beta --stdout 2>/dev/null)" "PRIVATE-KEY-BETA"
+out="$(KEYVAULT_THREADING_SOCKET="$F/none.sock" notty env -u KEYVAULT_SE_IDENTITY "$SHELL_BIN" "$KV" show beta --stdout --via iphone 2>&1)"
+grep -q 'Face ID approvals are off' <<<"$out" && ok "without Threading it says what to turn on" || no "without Threading it says what to turn on" "$out"
+kv device remove iphone >/dev/null 2>&1
+[[ -e $KEYVAULT_KEYS/biometric.iphone.envelope ]] && no "device remove iphone forgets it" || ok "device remove iphone forgets it"
+kill "$FAKE_PID" 2>/dev/null; FAKE_PID=""
 
 # ---------------------------------------------------------------------------- ramdisk
 

@@ -225,6 +225,28 @@ watcher takes its deadline and location from its own arguments, never from the g
 so the grantee cannot extend its loan. Every request, approval, denial, use, revocation and
 expiry is logged to `~/.local/state/keyvault/audit.log`.
 
+### Approving from your iPhone
+
+With [Threading](https://github.com/everlof/threading) paired to your iPhone, Face ID on the
+phone can stand in for this Mac's Touch ID:
+
+```bash
+keyvault device add iphone                    # once: Touch ID, then the key is sealed to the phone
+keyvault approve --via iphone                 # or an agent: keyvault request … --via iphone
+```
+
+Turn it on in Threading → Settings → Remote Access → Face ID Approvals and enroll the phone
+there first. `device add iphone` then has Threading seal the biometric key to a key in the
+iPhone's Secure Enclave that only Face ID can use; the result,
+`keys/biometric.iphone.envelope`, is useless anywhere else, and Threading keeps nothing. With
+`--via iphone` the phone shows what is being asked, which grant, why, and which process on the
+Mac asked, as the Mac's kernel reports it rather than as the asker claims. After Face ID the phone
+opens the key and hands it back over the pinned connection, and keyvault checks it itself:
+anything but this vault's biometric key is refused.
+
+It replaces Touch ID only. Items at `passphrase` or `both` still need the passphrase at the Mac,
+and Touch ID keeps working beside it. `keyvault device remove iphone` forgets the phone.
+
 ### What that does and does not protect
 
 **An agent cannot approve its own request.** Its shell has no terminal: it can neither answer
@@ -349,14 +371,6 @@ The test suite also uses `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY` 
 `KEYVAULT_RECOVERY_IDENTITY` to stand plain age keys in for the Secure Enclave, the passphrase
 and the paper. Anyone who can set them does not need keyvault's permission: never set them in
 an environment an agent can see.
-
-## Coming next
-
-**Face ID on your iPhone, via Threading.** The biometric key is
-one key, wrapped once per device (`keys/biometric.<device>.age`). A paired iPhone becomes one
-more wrap. Approving a loan with `--via iphone` sends the request to the phone, you approve it
-with Face ID, and the phone unwraps the key for that one command. Nothing is re-encrypted, and
-the Mac never waits on a Touch ID sensor you are nowhere near.
 
 ## Design notes
 
