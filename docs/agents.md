@@ -64,6 +64,8 @@ A dialog on the user's screen asks them for the value. It goes from there into t
 with a backup in the vault, and you never see it. They also choose whether you may use it
 freely or whether every use asks them first. Then use it with `keyvault secret run`.
 Name it the way the tool expects (`UPPER_SNAKE`), and say in `--desc` what it is for.
+A second dialog asks when it expires. If the user already told you (a 90-day token, a date),
+pass `--expires 90d` or `--expires 2026-12-01` and that dialog is skipped.
 
 **Not everything is a secret.** A username, an account or project id, a region: don't
 `request` those (a hidden dialog for a username is just friction). Store them yourself, next
@@ -80,6 +82,20 @@ Only when the user asks you to. It asks for nothing, and `keyvault catalog` show
 
 Items marked `ask` raise a macOS dialog the user must click. If one appears, tell them what
 you are running and why. Never use `secret get` in scripts, or print a value.
+
+## Expired, or about to be?
+
+`keyvault describe <id>` says when an item expires, and when it already has: then it no
+longer works, so tell the user instead of retrying. `keyvault expiring` lists everything
+dated, soonest first, with how to renew each. Renewing is the user's job; you can point at it.
+
+## Keys left in files
+
+    keyvault scan <path> --json     # e.g. a repo before a commit, or a folder the user names
+
+It finds keys and tokens (gitleaks' rules) and says what each finding means. It never shows a
+value, so it is safe to run. If it finds one in the project you work on, tell the user and
+suggest moving it into keyvault; don't open the file to look at the value.
 
 ## Borrow it, for this job only
 
@@ -99,8 +115,8 @@ in case".
 
 - Set `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY`, `KEYVAULT_RECOVERY_IDENTITY`,
   `KEYVAULT_NEW_RECOVERY_IDENTITY` or `KEYVAULT_DIALOG`, or run `setup`, `show`, `restore`,
-  `verify`, `validate`, `pack`, `remove`, `approve` or `grant`. Those are the user's commands,
-  and several put a Touch ID or passphrase prompt on their screen.
+  `verify`, `validate`, `pack`, `remove`, `approve`, `grant`, `remind` or `schedule`. Those are
+  the user's commands, and several put a Touch ID, passphrase or permission prompt on their screen.
 - Use `secret get`, or `add --stdin` / `secret set --stdin` with a value you were given.
   A value that passed through you is exposed; use `keyvault secret request`.
 - Read `/Volumes/keyvault-*` directly, or copy granted files elsewhere.

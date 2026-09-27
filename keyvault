@@ -183,11 +183,14 @@ tokens_list() {
 # copy gone stale shows without decrypting anything.
 token_id()      { printf 'secret-%s\n' "$1"; }
 token_changed() { tokens_list | jq -r --arg n "$1" '.[] | select(.name == $n) | .changed // ""'; }
-token_seal() {   # token_seal <name> <ask 0|1> <desc> [plain 0|1] — the value on stdin
+# The date a token's copy carries, if it is one: a replacement inherits it, and a date that
+# cannot be read is not worth inheriting (add would refuse it, and the backup with it).
+token_expires() { expiry_valid "$(jq -r --arg id "$(token_id "$1")" 'first(.items[]? | select(.id == $id) | .meta.expires) // ""' "$KV_CATALOG" 2>/dev/null)"; }
+token_seal() {   # token_seal <name> <ask 0|1> <desc> [plain 0|1] [expires] — the value on stdin
     local changed; changed="$(token_changed "$1" </dev/null)"
     "${BASH:-bash}" "$KV_ROOT/keyvault" add "$(token_id "$1")" --stdin --level both --desc "$3" \
         --meta "token=$1" --meta "ask=$( (( $2 )) && echo true || echo false)" --meta "changed=$changed" \
-        $( (( ${4:-0} )) && echo --meta plain=true)
+        $( (( ${4:-0} )) && echo --meta plain=true) ${5:+--meta "expires=$5"}
 }
 
 # ------------------------------------------------------------- ed25519, without a keychain
@@ -1052,9 +1055,17 @@ cmd_pack() {
     done
     KV_CUR_LEVEL=""
 
-    local m mid
+    local m mid mx
     for m in ${KV_META[@]+"${KV_META[@]}"}; do
         mid="$(jq -r '.id' <<<"$m")"
+        # A date the config got wrong is dropped here, loudly: carried into the catalog, it
+        # would read as "no date" everywhere downstream. A span (90d) means nothing in a file
+        # that is read again at every pack, so the config takes dates only.
+        mx="$(jq -r '.meta.expires // ""' <<<"$m")"
+        if [[ -n $mx && $(expiry_parse "$mx") != "$mx" ]]; then
+            warn "meta $mid  expires=$mx is not a date (2026-12-01) or never — left out"
+            m="$(jq -c 'del(.meta.expires)' <<<"$m")"
+        fi
         if mf_has "$mid"; then
             mf_write --arg id "$mid" --argjson m "$(jq -c '.meta' <<<"$m")" \
                 '.items |= map(if .id == $id then .meta = ((.meta // {}) + $m) else . end)'
@@ -1147,9 +1158,9 @@ cmd_list() {
 # removing one deletes (after archiving), so neither ever needs Touch ID or the passphrase.
 
 cmd_add() {
-    (($#)) || die "usage: keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc TEXT] [--meta k=v] [--restore-to PATH]"
+    (($#)) || die "usage: keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc TEXT] [--expires DATE] [--meta k=v] [--restore-to PATH]"
     local id="$1"; shift
-    local src="" mode="" desc="" restore_to="" extra='{}' lv=""
+    local src="" mode="" desc="" restore_to="" extra='{}' lv="" ex
     while (($#)); do
         case "$1" in
             --file)       mode=file;   src="$2"; shift 2 ;;
@@ -1159,7 +1170,11 @@ cmd_add() {
             --level)      lv="$2";         shift 2 ;;
             --restore-to) restore_to="$2"; shift 2 ;;
             --meta)       [[ $2 == *=* ]] || die "add: --meta wants key=value"
+                          [[ ${2%%=*} == expires ]] && { set -- --expires "${2#*=}" "${@:3}"; continue; }
                           extra="$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '. + {($k): $v}' <<<"$extra")"
+                          shift 2 ;;
+            --expires)    ex="$(expiry_or_die "${2:-}")" || exit 1
+                          extra="$(jq -c --arg v "$ex" '. + {expires: $v}' <<<"$extra")"
                           shift 2 ;;
             *) die "add: unknown option '$1'" ;;
         esac
@@ -1257,6 +1272,7 @@ cmd_secret() {
         set)       secret_set "$sb" "$@" ;;
         rm|remove) secret_rm "$sb" "$@" ;;
         backup)    secret_backup "$sb" ;;
+        expires)   secret_expires "$sb" "$@" ;;
         help|--help|-h|"") secret_help ;;
         request)   # an agent asks the user for a token it never sees: agent access lives there
                    # shellcheck source=keyvault-access.sh
@@ -1270,11 +1286,16 @@ secret_help() {
     cat <<EOF
 ${C_BOLD}keyvault secret${C_RESET} — tokens in the macOS keychain, one command at a time, backed up in keyvault
 
-  set NAME [--ask] [--desc T] [--stdin]   store it (typed, or piped), and seal a copy in the vault
-                                         --ask: every use raises the keychain dialog
+  set NAME [--ask] [--desc T] [--expires D] [--stdin]
+                            store it (typed, or piped), and seal a copy in the vault
+                            --ask: every use raises the keychain dialog
+                            --expires: 2026-12-01, 90d, 6m, 1y or never — 'keyvault expiring' and
+                            'keyvault remind' then tell you before it stops working
   set NAME --plain VALUE [--desc T]      not a secret (a username, an account id): stored beside
                                          the secrets it goes with, its value shown in list and catalog
-  request NAME --desc T     for agents: a dialog asks the user for the value; the agent never sees it
+  expires NAME DATE         when an existing token stops working (the value stays as it is)
+  request NAME --desc T [--expires D]
+                            for agents: a dialog asks the user for the value; the agent never sees it
   run NAME [VAR=NAME …] -- <command…>    run with those tokens in the environment, for that command only
   list [--json]             names and descriptions, never values
   get NAME                  print one value: for pasting by hand, never in scripts, never by agents
@@ -1285,12 +1306,13 @@ EOF
 
 secret_set() {
     local sb="$1"; shift
-    (($#)) || die "usage: keyvault secret set NAME [--desc TEXT] [--ask | --plain VALUE] [--stdin]"
+    (($#)) || die "usage: keyvault secret set NAME [--desc TEXT] [--ask | --plain VALUE] [--expires DATE] [--stdin]"
     local name="$1"; shift
-    local desc="" ask=0 stdin=0 plain=0 v="" v2 err
+    local desc="" ask=0 stdin=0 plain=0 v="" v2 err exp="" old e
     while (($#)); do
         case "$1" in
             --desc)  desc="$2"; shift 2 ;;
+            --expires) exp="$(expiry_or_die "${2:-}")" || exit 1; shift 2 ;;
             --ask)   ask=1; shift ;;
             --plain) plain=1; v="${2:-}"; shift 2 || die "--plain wants the value: it is not a secret" ;;
             --stdin) stdin=1; shift ;;
@@ -1308,30 +1330,73 @@ secret_set() {
         { exec 4</dev/tty; } 2>/dev/null || die "no terminal to type into — use --stdin"
         printf 'Value for %s (not echoed): ' "$name" >/dev/tty; IFS= read -rs v <&4; printf '\n' >/dev/tty
         printf 'Again: ' >/dev/tty;                          IFS= read -rs v2 <&4; printf '\n' >/dev/tty
-        exec 4<&-
         [[ $v == "$v2" ]] || die "the two entries differ"
+        # Whoever types a token has just made it, and knows when it runs out. Ask now, once:
+        # a date nobody wrote down is how a key "suddenly" stops working.
+        old="$(token_expires "$name")"
+        while [[ -z $exp ]]; do
+            printf 'Expires? 2026-12-01, 90d, 1y or never (Enter: %s): ' "${old:-not recorded}" >/dev/tty
+            IFS= read -r e <&4 || break
+            [[ -z $e ]] && { exp="$old"; break; }
+            exp="$(expiry_parse "$e")" || printf '  not a date or a span: %s\n' "$e" >/dev/tty
+        done
+        exec 4<&-
     fi
     [[ -n $v ]] || die "empty value"
-    token_store "$sb" "$name" "$ask" "$desc" "$v" "$plain"
+    # Piped in, a replaced value keeps the date it had: a reminder that turns out early is
+    # cheap; one silently dropped is the whole problem.
+    old="$(token_expires "$name")"
+    [[ -z $exp ]] && exp="$old"
+    token_store "$sb" "$name" "$ask" "$desc" "$v" "$plain" "$exp" || return 1
+    (( stdin )) && [[ -n $old && $old != never && $exp == "$old" ]] \
+        && note "$name  still expires $old, as before — if the new value lasts longer: keyvault secret expires $name <date>"
+    return 0
 }
 
-# token_store <secret> <name> <ask 0|1> <desc> <value> [plain 0|1] — into the keychain, then
-# the vault's copy. A function argument is not a process's argv: the value never shows in
-# `ps`. (A plain value does: it is not a secret.)
+# token_store <secret> <name> <ask 0|1> <desc> <value> [plain 0|1] [expires] — into the keychain,
+# then the vault's copy. A function argument is not a process's argv: the value never shows
+# in `ps`. (A plain value does: it is not a secret.)
 token_store() {
-    local sb="$1" name="$2" ask="$3" desc="$4" plain="${6:-0}" err
+    local sb="$1" name="$2" ask="$3" desc="$4" plain="${6:-0}" exp="${7:-}" err
     if (( plain )); then
         "$sb" set "$name" --plain "$5" --desc "$desc" || return 1
     else
         # shellcheck disable=SC2046
         printf '%s' "$5" | "$sb" set "$name" --stdin --desc "$desc" $( ((ask)) && echo --ask) || return 1
     fi
-    if err="$(printf '%s' "$5" | token_seal "$name" "$ask" "$desc" "$plain" 2>&1 >/dev/null)"; then
+    if err="$(printf '%s' "$5" | token_seal "$name" "$ask" "$desc" "$plain" "$exp" 2>&1 >/dev/null)"; then
         ok "$name  backed up in keyvault"
+        expiry_said "$name" "$exp"
     else
         warn "$name  is stored, but NOT backed up in keyvault: ${err#keyvault: }"
         note "fix that, then run: keyvault secret backup"
         return 1
+    fi
+}
+
+expiry_said() {   # expiry_said <name> <expires> — what was recorded, and how to hear about it
+    [[ -n $2 ]] || return 0
+    [[ $2 == never ]] && { ok "$1  never expires"; return 0; }
+    ok "$1  expires $2 ($(when_text "$(days_until "$2")"))"
+    reminders_on || note "a reminder on your Mac and iPhone before it does: keyvault remind"
+}
+
+# The date alone, for a token already stored: its copy is sealed again with the value the
+# keychain holds, so nothing is typed. An --ask token raises the keychain dialog to be read.
+secret_expires() {
+    local sb="$1"; shift
+    (( $# == 2 )) || die "usage: keyvault secret expires NAME <2026-12-01 | 90d | 6m | 1y | never>"
+    local name="$1" exp t err
+    exp="$(expiry_or_die "$2")" || exit 1
+    t="$(tokens_list | jq -c --arg n "$name" 'first(.[] | select(.name == $n)) // empty')"
+    [[ -n $t ]] || die "no token $name (keyvault secret list)"
+    [[ $(jq -r '.ask' <<<"$t") == true ]] && info "  reading $name raises the keychain dialog — click Allow"
+    if err="$("$sb" get "$name" 2>/dev/null \
+              | token_seal "$name" "$(jq -r 'if .ask then 1 else 0 end' <<<"$t")" "$(jq -r '.desc // ""' <<<"$t")" \
+                           "$(jq -r 'if .plain then 1 else 0 end' <<<"$t")" "$exp" 2>&1 >/dev/null)"; then
+        expiry_said "$name" "$exp"
+    else
+        die "$name  ${err#keyvault: }"
     fi
 }
 
@@ -1347,7 +1412,7 @@ secret_rm() {
 
 secret_backup() {   # copy every token whose copy is missing or older than the token
     local sb="$1" copies t name ask err n=0 rc=0
-    copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // "")}]' "$KV_CATALOG" 2>/dev/null)"
+    copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // ""), e: (.meta.expires // "")}]' "$KV_CATALOG" 2>/dev/null)"
     [[ -n $copies ]] || copies='[]'
     while IFS= read -r t; do
         name="$(jq -r '.name' <<<"$t")"; ask="$(jq -r '.ask' <<<"$t")"
@@ -1356,7 +1421,8 @@ secret_backup() {   # copy every token whose copy is missing or older than the t
         [[ $ask == true ]] && info "  reading $name raises the keychain dialog — click Allow"
         if err="$("$sb" get "$name" 2>/dev/null \
                   | token_seal "$name" "$([[ $ask == true ]] && echo 1 || echo 0)" "$(jq -r '.desc // ""' <<<"$t")" \
-                               "$([[ $(jq -r '.plain // false' <<<"$t") == true ]] && echo 1 || echo 0)" 2>&1 >/dev/null)"; then
+                               "$([[ $(jq -r '.plain // false' <<<"$t") == true ]] && echo 1 || echo 0)" \
+                               "$(expiry_valid "$(jq -r --arg n "$name" 'first(.[] | select(.t == $n) | .e) // ""' <<<"$copies")")" 2>&1 >/dev/null)"; then
             ok "$name  backed up"; n=$((n + 1))
         else
             bad "$name  ${err#keyvault: }"; rc=1
@@ -1637,12 +1703,31 @@ cmd_validate() {
         done
     fi
 
+    # Sound and current is still not enough when a key inside is about to stop working.
+    local due expiring=0 n x d
+    if ! due="$(expiry_items)"; then
+        warn "cannot read $(tildify "$KV_CATALOG") for expiry dates"; due='[]'; expiring=1
+    fi
+    due="$(expiry_due "$KV_EXPIRY_WARN_DAYS" <<<"$due")"
+    if [[ $due != "[]" ]]; then
+        while IFS=$'\x1f' read -r n x d; do
+            if [[ -z $d ]]; then warn "$n  has a date that cannot be read: $x"
+            elif (( d < 0 )); then warn "$n  expired $x"
+            else warn "$n  expires $x ($(when_text "$d"))"; fi
+        done < <(jq -r '.[] | [.name, (.expires // .bad), (.days // "" | tostring)] | join("\u001f")' <<<"$due")
+        note "how to renew each: keyvault expiring"
+        expiring=1
+    fi
+
     say ""
     if (( rc )); then
         bad "validation failed"
     elif (( stale )); then
         warn "the vault is sound but out of date — run 'keyvault pack'"
         return 2        # distinct from 1 (broken), so a scheduled check can tell them apart
+    elif (( expiring )); then
+        warn "the vault matches this machine, but something in it expires within $KV_EXPIRY_WARN_DAYS days"
+        return 2
     else
         ok "the vault matches this machine"
     fi
@@ -1896,6 +1981,8 @@ cmd_doctor() {
         warn "python3 cryptography missing — 'verify' cannot derive public keys"
         note "    pip3 install cryptography"
     fi
+    if have gitleaks; then ok "gitleaks  $(command -v gitleaks)  (for 'keyvault scan')"
+    else warn "gitleaks missing — 'keyvault scan' needs it: brew install gitleaks"; fi
     local sb; sb="$(kv_sparkle_bin)"
     if [[ -n $sb ]]; then ok "Sparkle tools  $(tildify "$sb")"
     else warn "Sparkle tools not found — build a Sparkle app once, or set KEYVAULT_SPARKLE_BIN"; fi
@@ -1909,6 +1996,19 @@ cmd_doctor() {
     else
         warn "no keys yet — run 'keyvault setup'"
     fi
+
+    step "Expiry"
+    local due
+    if ! due="$(expiry_items)"; then
+        bad "cannot read $(tildify "$KV_CATALOG")"
+    else
+        due="$(expiry_due "$KV_EXPIRY_WARN_DAYS" <<<"$due" | jq length)"
+        if (( due )); then warn "$due item$( ((due == 1)) || echo s) expired, expiring within $KV_EXPIRY_WARN_DAYS days, or with an unreadable date — keyvault expiring"
+        else ok "nothing expires within $KV_EXPIRY_WARN_DAYS days"; fi
+    fi
+    if ! reminders_on; then note "reminders off — keyvault remind"
+    elif reminders_behind; then warn "reminders on, but behind the vault — keyvault remind"
+    else ok "reminders on  (Reminders ▸ $KV_REMIND_LIST)"; fi
 
     step "Configuration"
     [[ -f $KV_CONF ]] && ok "config  $(tildify "$KV_CONF")" || bad "config  $(tildify "$KV_CONF") is missing"
@@ -1985,7 +2085,8 @@ catalog_save() {   # catalog_save <items-json> [packed_at]
           recipients: {biometric: $rb, passphrase: $rp, recovery: $rr},
           items: ($items | sort_by(.id))}' > "$KV_CATALOG.new" \
         && mv -f "$KV_CATALOG.new" "$KV_CATALOG" \
-        || warn "could not write $(tildify "$KV_CATALOG")"
+        || { warn "could not write $(tildify "$KV_CATALOG")"; return 0; }
+    reminders_follow
 }
 
 # pack: declared items are replaced wholesale; hand-added ones, and identities pack kept
@@ -2012,6 +2113,272 @@ catalog_upsert() {   # catalog_upsert <manifest> — replace entries with the sa
 }
 
 catalog_drop() { catalog_save "$(catalog_items | jq -c --arg id "$1" 'map(select(.id != $id))')"; }
+
+# ---------------------------------------------------------------------------- expiry
+#
+# When a key stops working, and a reminder before it does. A certificate says so itself
+# (not_after); anything else carries meta.expires, from --expires: a date, a span from
+# today (90d, 12w, 6m, 1y), or `never`, which also quiets a certificate kept on purpose.
+# All of it comes from the catalog: knowing what expires never needs an unlock.
+
+readonly KV_EXPIRY_WARN_DAYS="${KEYVAULT_EXPIRY_WARN_DAYS:-30}"
+readonly KV_REMIND_DAYS="${KEYVAULT_REMIND_DAYS:-14}"         # how long before, the reminder is due
+readonly KV_REMIND_LIST="Keyvault"
+readonly KV_REMIND_STATE="$KV_STATE/reminders.json"           # there: reminders are on
+
+kv_today() { printf '%s\n' "${KEYVAULT_TODAY:-$(date +%F)}"; }  # tests pin the date
+
+expiry_parse() {   # expiry_parse <2026-12-01 | 90d | 12w | 6m | 1y | never>  -> YYYY-MM-DD or never
+    local v="$1" d=""
+    [[ $v == never ]] && { printf 'never\n'; return 0; }
+    if [[ $v =~ ^[0-9]{1,4}[dwmy]$ ]]; then
+        d="$(date -j -v+"$v" -f %F "$(kv_today)" +%F 2>/dev/null)"
+    elif [[ $v =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        d="$(date -j -f %F "$v" +%F 2>/dev/null)"
+        [[ $d == "$v" ]] || d=""        # date rolls 2026-02-30 over into March; refuse it instead
+    fi
+    # A span can run past year 9999 (9999y): refuse what is not a four-digit year.
+    [[ $d =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && printf '%s\n' "$d"
+}
+expiry_valid() { [[ -n $1 && $(expiry_parse "$1") == "$1" ]] && printf '%s\n' "$1"; return 0; }   # a date or never, else nothing
+expiry_or_die() { expiry_parse "$1" || die "--expires wants a date (2026-12-01), a span from today (90d, 12w, 6m, 1y) or never — got '$1'"; }
+
+days_until() {   # days_until <YYYY-MM-DD> -> whole days from today, negative once it has passed
+    jq -rn --arg d "$1" --arg t "$(kv_today)" '((($d | strptime("%Y-%m-%d") | mktime) - ($t | strptime("%Y-%m-%d") | mktime)) / 86400) | floor'
+}
+when_text() {   # when_text <days> -> "in 12 days" · "today" · "12 days ago"
+    local n="$1"
+    if (( n == 0 )); then printf 'today\n'
+    elif (( n == 1 )); then printf 'tomorrow\n'
+    elif (( n > 1 )); then printf 'in %s days\n' "$n"
+    elif (( n == -1 )); then printf 'yesterday\n'
+    else printf '%s days ago\n' "$(( -n ))"; fi
+}
+
+# Every dated item, soonest first: [{id, name, kind, expires, days, source, renew, auto?}]. A
+# token goes by its name in `secret`; each keychain identity is an entry of its own, and an
+# Apple Development one is auto: Xcode issues a new one by itself when it runs out. A date that
+# cannot be read comes out as {expires: null, days: null, bad: "<what it said>"} rather than
+# taking the rest down with it, and an unreadable catalog is an error, never an empty list:
+# to the reminders, an empty list means "delete them all".
+#
+# LC_ALL=C: a certificate's date says "Oct 23", and under a Swedish locale %b wants "okt".
+expiry_items() {
+    [[ -f $KV_CATALOG ]] || { echo '[]'; return 0; }
+    LC_ALL=C jq -c --arg today "$(kv_today)" '
+        def ymd: try (strptime("%b %d %H:%M:%S %Y GMT") | mktime | strftime("%Y-%m-%d")) catch null;
+        def day: strptime("%Y-%m-%d") | mktime;
+        def isodate: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+                     and ((try (strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")) catch null) == .);
+        def checked($raw): if $raw | isodate then {expires: $raw} else {expires: null, bad: $raw} end;
+        [ .items[]? | (.meta.expires // "") as $set |
+          if $set == "never" then empty
+          elif $set != "" then
+              {id, name: (.meta.token // .id), kind: (if .meta.token then "token" else .kind end), source: "set",
+               renew: (if .meta.token then "store the new value: keyvault secret set \(.meta.token) --expires <date>"
+                       elif .adhoc and .type == "secret" then "pipe the new value to: keyvault add \(.id) --stdin --expires <date>"
+                       elif .adhoc then "keyvault add \(.id) --file <renewed file> --expires <date>"
+                       else "replace it, change meta \(.id) expires=<date> in keyvault.conf, then keyvault pack" end)}
+              + checked($set)
+          elif .meta.not_after then
+              {id, name: .id, kind, source: "certificate"} + checked(.meta.not_after | ymd // .)
+              + {renew: (if .adhoc then "keyvault add \(.id) --file <renewed certificate>"
+                         else "replace \(.path // .id) with the renewed certificate, then keyvault pack" end)}
+          elif .type == "identities" then
+              .id as $in | .certs[]? | select(.not_after) |
+              (.name // "" | test("^(Apple Development|iPhone Developer|Mac Developer): ")) as $xcode |
+              {id: "\($in)/\((.sha1 // "")[0:12])", name, kind: "certificate", source: "certificate",
+               renew: (if $xcode then "nothing to do: Xcode makes a new one when it needs to; keyvault pack then backs it up"
+                       else "renew it (Xcode ▸ Settings ▸ Accounts, or developer.apple.com), then keyvault pack" end)}
+              + (if $xcode then {auto: true} else {} end)
+              + checked(.not_after | ymd // .)
+          else empty end ]
+        | map(. + {days: (if .expires then ((((.expires | day) - ($today | day)) / 86400) | floor) else null end)})
+        | sort_by(.expires, .name)' "$KV_CATALOG" 2>/dev/null
+}
+
+# The ones to act on: due within <days>, past, or with a date that cannot be read. A
+# development certificate (auto) is Xcode's to renew, not yours: listed, never due.
+expiry_due() { jq -c --argjson w "$1" 'map(select((.auto | not) and (.days == null or .days <= $w)))'; }
+
+cmd_expiring() {
+    local json=0 within=""
+    while (($#)); do
+        case "$1" in
+            --json)   json=1; shift ;;
+            --within) within="${2:-}"; shift 2 || die "--within wants a number of days" ;;
+            *) die "expiring: unknown option '$1'" ;;
+        esac
+    done
+    [[ -z $within || $within =~ ^[0-9]+$ ]] || die "--within wants a number of days"
+    have jq || die "jq is not installed"
+    local items warn_days="${within:-$KV_EXPIRY_WARN_DAYS}" due
+    items="$(expiry_items)" || die "cannot read $(tildify "$KV_CATALOG")"
+    [[ -n $within ]] && items="$(expiry_due "$within" <<<"$items")"
+    due="$(expiry_due "$warn_days" <<<"$items")"
+
+    if (( json )); then
+        jq . <<<"$items"
+    elif [[ $items == "[]" ]]; then
+        if [[ -n $within ]]; then ok "nothing expires within $within days"
+        else
+            say "Nothing in the vault has an expiry date."
+            note "give a token one: keyvault secret expires NAME 90d   (or --expires when you set it)"
+        fi
+    else
+        printf '%-11s %-15s %-20s %s\n' EXPIRES WHEN KIND NAME
+        local e d k n c w
+        while IFS=$'\x1f' read -r e d k n; do
+            if [[ -z $d ]]; then c="$C_RED"; w="unreadable date"
+            else w="$(when_text "$d")"; c=""; (( d <= warn_days )) && c="$C_YELLOW"; (( d < 0 )) && c="$C_RED"; fi
+            [[ $n == *$'\x1e' ]] && { c=""; n="${n%$'\x1e'}  $C_DIM(Xcode renews it)$C_RESET"; }
+            printf '%s%-11s %-15s%s %-20s %s\n' "$c" "$e" "$w" "$C_RESET" "$k" "$n"
+        done < <(jq -r '.[] | [(.expires // "?"), (.days // "" | tostring), (.kind // ""), .name + (if .auto then "\u001e" else "" end)] | join("\u001f")' <<<"$items")
+        if [[ $due != "[]" ]]; then
+            say ""
+            say "${C_BOLD}To renew${C_RESET}"
+            jq -r '.[] | "  \(.name)\n      " + (if .bad then "its date, \"\(.bad)\", is not a date: set one (2026-12-01)" else .renew end)' <<<"$due"
+            jq -e 'any(.[]; .days != null and .days < 0)' <<<"$due" >/dev/null \
+                && note "keeping an expired one on purpose? keyvault secret expires NAME never, or meta ID expires=never in keyvault.conf"
+        fi
+        say ""
+        if ! reminders_on; then dim "A reminder on your Mac and iPhone $KV_REMIND_DAYS days before each: keyvault remind"
+        elif reminders_behind; then dim "Reminders ▸ $KV_REMIND_LIST is behind the vault (an update failed): keyvault remind"
+        else dim "Reminders ▸ $KV_REMIND_LIST has one for each, due $KV_REMIND_DAYS days before."; fi
+    fi
+    [[ $due == "[]" ]] || return 2
+}
+
+# ---------------------------------------------------------------------------- reminders
+#
+# One reminder per dated item in Reminders ▸ Keyvault, due KV_REMIND_DAYS before it
+# expires; iCloud carries it to the phone. The catalog is the truth and the list follows
+# it: every catalog write re-syncs when a date changed, so a renewed token moves its
+# reminder and a removed one takes it along. Each reminder's notes end in a tag,
+# [keyvault:<id>|<expires>], which is how keyvault finds its own and leaves the rest alone.
+
+reminders_on() { [[ -f $KV_REMIND_STATE ]]; }
+
+# JavaScript for Automation: one JSON request in, {list, ops:[…]}; the list's keyvault
+# reminders out, [{rid, id, expires, completed}]. Data reaches it as an argument, never as code.
+read -r -d '' KV_REMINDERS_JXA <<'JXA'
+function run(argv) {
+    const req = JSON.parse(argv[0]);
+    const app = Application('Reminders');
+    let found = app.lists.whose({name: req.list})();
+    if (!found.length) {
+        if (!req.ops.length) return '[]';
+        app.make({new: 'list', withProperties: {name: req.list}});
+        found = app.lists.whose({name: req.list})();
+    }
+    const list = found[0];
+    const at = (ymd) => { const p = ymd.split('-').map(Number); return new Date(p[0], p[1] - 1, p[2], 9, 0, 0); };
+    for (const op of req.ops) {
+        if (op.op === 'create') {
+            list.reminders.push(app.Reminder({name: op.name, body: op.body, dueDate: at(op.due), remindMeDate: at(op.due)}));
+            continue;
+        }
+        const r = list.reminders.byId(op.rid);
+        if (op.op === 'delete') { app.delete(r); continue; }
+        r.name = op.name; r.body = op.body; r.dueDate = at(op.due); r.remindMeDate = at(op.due); r.completed = false;
+    }
+    const ids = list.reminders.id(), bodies = list.reminders.body(), done = list.reminders.completed();
+    const out = [];
+    ids.forEach((rid, i) => {
+        const m = /\[keyvault:(.+)\|(\d{4}-\d{2}-\d{2})\]\s*$/.exec(bodies[i] || '');
+        if (m) out.push({rid: rid, id: m[1], expires: m[2], completed: done[i]});
+    });
+    return JSON.stringify(out);
+}
+JXA
+
+reminders_call() {   # reminders_call <request-json> -> the list's keyvault reminders
+    if [[ -n ${KEYVAULT_REMINDERS_BIN:-} ]]; then "$KEYVAULT_REMINDERS_BIN" "$1"; return; fi   # tests
+    have osascript || { printf 'osascript is missing\n' >&2; return 1; }
+    osascript -l JavaScript -e "$KV_REMINDERS_JXA" "$1"
+}
+
+# What to change so the list matches the catalog. A reminder whose item is gone, or now
+# never expires, is deleted; a changed date moves it (and reopens it, if it was ticked off);
+# a new date gets one, unless that date has already passed. Duplicates collapse to one.
+reminders_plan() {   # reminders_plan <wanted> <present> -> [ops]
+    jq -nc --argjson want "$(jq -c 'map(select(.auto | not))' <<<"$1")" --argjson have "$2" --arg today "$(kv_today)" --argjson lead "$KV_REMIND_DAYS" '
+        def day: strptime("%Y-%m-%d") | mktime;
+        def due: [(.expires | day) - $lead * 86400, ($today | day)] | max | strftime("%Y-%m-%d");
+        def text: {name: "Renew \(.name) — expires \(.expires)", due: due,
+                   body: "\(.name) (\(.kind)) expires on \(.expires).\nTo renew: \(.renew)\n\n[keyvault:\(.id)|\(.expires)]"};
+        ($want | map({key: .id, value: .}) | from_entries) as $w
+        | [ ($have | group_by(.id) | .[]
+              | (.[1:][] | {op: "delete", rid}),
+                (.[0] as $r | $w[$r.id] as $x
+                 | if $x == null then {op: "delete", rid: $r.rid}
+                   elif $x.expires == null then empty          # an unreadable date is no reason to delete
+                   elif $x.expires != $r.expires then {op: "update", rid: $r.rid} + ($x | text)
+                   else empty end)),
+            ($want[] | select(.days != null and .days >= 0) | . as $x | select(any($have[]; .id == $x.id) | not) | {op: "create"} + text) ]'
+}
+
+reminders_digest() {   # reminders_digest [items] — what the list was last made to match
+    local items="${1:-}"
+    [[ -n $items ]] || items="$(expiry_items)" || return 1
+    jq -c 'map(select(.auto | not) | [.id, .expires])' <<<"$items" | shasum -a 256 | awk '{print $1}'
+}
+# On, but the last update did not get through: dates changed since.
+reminders_behind() { [[ $(jq -r '.synced // ""' "$KV_REMIND_STATE" 2>/dev/null) != "$(reminders_digest)" ]]; }
+
+reminders_sync() {   # reminders_sync [quiet] — make Reminders ▸ Keyvault match the catalog
+    local want have plan d
+    want="$(expiry_items)" || { printf 'cannot read %s\n' "$(tildify "$KV_CATALOG")" >&2; return 1; }
+    d="$(reminders_digest "$want")"
+    have="$(reminders_call "$(jq -nc --arg l "$KV_REMIND_LIST" '{list: $l, ops: []}')")" || return 1
+    jq -e 'type == "array"' <<<"$have" >/dev/null 2>&1 || { printf 'Reminders answered: %s\n' "$have" >&2; return 1; }
+    plan="$(reminders_plan "$want" "$have")" || return 1
+    if [[ $plan != "[]" ]]; then
+        reminders_call "$(jq -nc --arg l "$KV_REMIND_LIST" --argjson ops "$plan" '{list: $l, ops: $ops}')" >/dev/null || return 1
+    fi
+    mkdir -p "$KV_STATE"
+    jq -n --arg d "$d" --arg t "$(now_utc)" '{synced: $d, at: $t}' > "$KV_REMIND_STATE.new" \
+        && mv -f "$KV_REMIND_STATE.new" "$KV_REMIND_STATE"
+    [[ ${1:-} == quiet ]] && return 0
+    local c u r
+    c="$(jq '[.[] | select(.op == "create")] | length' <<<"$plan")"
+    u="$(jq '[.[] | select(.op == "update")] | length' <<<"$plan")"
+    r="$(jq '[.[] | select(.op == "delete")] | length' <<<"$plan")"
+    if (( c + u + r )); then ok "Reminders ▸ $KV_REMIND_LIST: $c added, $u moved, $r removed"
+    else ok "Reminders ▸ $KV_REMIND_LIST is up to date"; fi
+}
+
+# After a catalog write: re-sync if reminders are on and a date changed. Never fatal, as
+# the write already happened; the next write, or 'keyvault remind', tries again.
+reminders_follow() {
+    reminders_on || return 0
+    reminders_behind || return 0
+    reminders_sync quiet 2>/dev/null || warn "could not update Reminders ▸ $KV_REMIND_LIST — run: keyvault remind"
+}
+
+cmd_remind() {
+    have jq || die "jq is not installed"
+    case "${1:-on}" in
+        on|sync)
+            local first=0; reminders_on || first=1
+            reminders_sync \
+                || die "could not reach Reminders — allow it under System Settings ▸ Privacy & Security ▸ Automation, then run this again"
+            local n; n="$(expiry_items | jq 'map(select((.auto | not) and .days != null and .days >= 0)) | length')"
+            note "$n dated item$( ((n == 1)) || echo s) ahead, each with a reminder $KV_REMIND_DAYS days before — see: keyvault expiring"
+            (( first )) && note "from now on a changed date moves its reminder; to stop: keyvault remind off"
+            return 0
+            ;;
+        off)
+            rm -f "$KV_REMIND_STATE"
+            ok "reminders off: keyvault no longer changes Reminders ▸ $KV_REMIND_LIST (what is there stays)"
+            ;;
+        status)
+            if reminders_on; then ok "on — Reminders ▸ $KV_REMIND_LIST, last synced $(jq -r '.at // "never"' "$KV_REMIND_STATE")"
+            else note "off — turn on with: keyvault remind"; fi
+            ;;
+        *) die "usage: keyvault remind [on | off | status]" ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------- destination README
 
@@ -2255,19 +2622,38 @@ ${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passph
   recovery-check              is the key on your paper the right one?
 
 ${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
-  add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
+  add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--expires D] [--meta k=v] [--restore-to P]
                               recovery codes, a licence, an .p8 — anything (asks for nothing)
   remove <id>                 take an added item out
   show <id> --out PATH        write one item back out
 
 ${C_BOLD}TOKENS — the 'secret' tool, backed up${C_RESET}
-  secret set NAME [--ask] [--desc T] [--stdin]   store a token, and seal a copy in the vault
+  secret set NAME [--ask] [--desc T] [--expires D] [--stdin]
+                              store a token, and seal a copy in the vault
   secret set NAME --plain VALUE [--desc T]       not a secret (a username, an id): shown, not hidden
   secret rm NAME              remove it, and its copy
   secret backup               copy the tokens stored with plain 'secret' (once)
   secret request NAME --desc T
                               for agents: a dialog asks the user for the value; the agent never sees it
   secret run NAME -- <cmd…>   run with it in the environment      ('keyvault secret help' for all)
+  secret expires NAME DATE    when it stops working: 2026-12-01, 90d, 6m, 1y or never
+
+${C_BOLD}EXPIRY — hearing about it before a key stops working${C_RESET}
+  expiring [--within DAYS] [--json]
+                              every dated key, token and certificate, soonest first; how to renew
+                              (asks for nothing; exit 2 when one is due within $KV_EXPIRY_WARN_DAYS days, or past)
+  remind [off | status]       keep Reminders ▸ $KV_REMIND_LIST in step: one reminder $KV_REMIND_DAYS days before
+                              each date, on your Mac and iPhone; moved when you renew, gone when you remove
+
+${C_BOLD}FINDING KEYS LEFT LYING AROUND${C_RESET}
+  scan [PATH…] [--json]       search files for keys and tokens (gitleaks' rules); never prints a value
+                              default: your home folder, iCloud Drive included, without caches
+  scan ignore <FINDING|PATH>  never report it again
+
+${C_BOLD}WHAT NEEDS DOING — without having to remember to look${C_RESET}
+  checkup [--no-scan]         dates due, certificates the vault lacks (renewed?), Reminders behind,
+                              and keys that turned up in files since the last checkup (exit 2: to do)
+  schedule on | off | status  the checkup weekly (launchd, Mondays 10:00), notifying you when it finds some
 
 ${C_BOLD}PUTTING IT BACK${C_RESET}
   restore [--only ID] [--force] [--apply]     dry run unless --apply
@@ -2329,10 +2715,19 @@ ${C_BOLD}USE A KEY${C_RESET}  (LEVEL biometric, passphrase or both: only the use
         Then: keyvault exec <grant> -- <command…>   (\$KV_<ID> is the file's path)
         and:  keyvault revoke <grant>               as soon as you are done
 
+${C_BOLD}EXPIRY${C_RESET}
+  keyvault describe <id> says when it expires, or that it has: then it no longer works, so
+  tell the user instead of retrying. keyvault expiring lists every date, with how to renew.
+
+${C_BOLD}KEYS LEFT IN FILES${C_RESET}  (never shows a value)
+  keyvault scan <path> --json   e.g. the repo you work in, before a commit. Found one? Tell the
+                                user; don't open the file to look.
+
 ${C_BOLD}STORE ONE${C_RESET}  (only when the user asks you to)
   a secret:    keyvault secret request NAME --desc "what it is, what it is for"
                A dialog asks the user for the value; it goes into the keychain and the
                vault and never passes through you. Never ask for it in the chat.
+               A second dialog asks when it expires; if the user told you, pass --expires 90d.
   not secret:  keyvault secret set NAME --plain VALUE --desc "…"
                A username, an account or project id, a region: store it yourself, no dialog.
                Don't 'request' those. Then: keyvault secret run USER_NAME PASSWORD_NAME -- …
@@ -2343,8 +2738,9 @@ ${C_BOLD}STORE ONE${C_RESET}  (only when the user asks you to)
 
 ${C_BOLD}NEVER${C_RESET}
   Print, copy or log a value: no 'secret get', no cat of a granted file, no echo of \$NAME.
-  Run 'show', 'restore', 'verify', 'validate', 'pack', 'remove', 'setup', 'approve' or 'grant':
-  they are the user's, and several put a Touch ID or passphrase prompt on their screen.
+  Run 'show', 'restore', 'verify', 'validate', 'pack', 'remove', 'setup', 'approve', 'grant',
+  'remind' or 'schedule': they are the user's, and several put a Touch ID, passphrase or
+  permission prompt on their screen.
   Run age against ~/.config/keyvault/keys, or set KEYVAULT_*_IDENTITY or KEYVAULT_DIALOG.
 EOF
 }
@@ -2366,6 +2762,13 @@ main() {
         setup)              cmd_setup "$@" ;;
         recovery-check)     cmd_recovery_check "$@" ;;
         secret)             cmd_secret "$@" ;;
+        expiring|expiry)    cmd_expiring "$@" ;;
+        remind|reminders)   cmd_remind "$@" ;;
+        scan|checkup|schedule)
+            # Watching the machine, not the vault: recovery never needs it either.
+            # shellcheck source=keyvault-watch.sh
+            source "$KV_ROOT/keyvault-watch.sh" || die "keyvault-watch.sh is missing"
+            watch_main "$cmd" "$@" ;;
         open|close|abort)   die "'$cmd' is gone in 2.0: writes never ask for anything any more, so there is no session to hold open" ;;
         status)             cmd_status ;;
         doctor)             cmd_doctor "$@" ;;
@@ -2384,5 +2787,7 @@ main() {
 }
 
 # Sourcing with KEYVAULT_LIB=1 loads the functions without running a command, which is
-# how tests/test_keyvault.sh reaches the internals.
-[[ ${KEYVAULT_LIB:-0} == 1 ]] || main "$@"
+# how tests/test_keyvault.sh reaches the internals. The exit is part of the same command, so
+# bash never reads past it: installed as a link into a checkout, this file can change under
+# a running scan (git pull), and bash would otherwise go on reading the new file mid-line.
+[[ ${KEYVAULT_LIB:-0} == 1 ]] || { main "$@"; exit; }

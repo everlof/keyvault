@@ -293,6 +293,105 @@ Values reach `security` hex-encoded on stdin, never in argv, so they never show 
 replacement parks the new value before it removes the old one, so a failure never loses
 both.
 
+## Expiry: hearing about it before a key stops working
+
+A token made with a 90-day lifetime works until the day it doesn't, and nothing in between
+says so. keyvault keeps the date with the key:
+
+```bash
+keyvault secret set GITHUB_TOKEN --expires 90d     # or 2026-12-01, 12w, 6m, 1y, never
+keyvault secret expires GITHUB_TOKEN 2026-12-01    # date a token already stored; the value stays
+keyvault add licence --file L.txt --expires 1y     # any hand-added item
+keyvault expiring                                  # everything dated, soonest first, and how to renew each
+keyvault remind                                    # Reminders ▸ Keyvault: one reminder 14 days ahead of each
+```
+
+Whoever makes a token knows when it runs out at that moment, and rarely afterwards, so that
+is when keyvault asks: typing a value at `secret set` prompts for the date, and `secret
+request` asks in a second dialog. Certificates need nothing. Their end date comes from the
+certificate itself, keychain identities included. In `keyvault.conf`, `meta <id>
+expires=2027-01-01` dates a declared file (a date, not a span: the config is read again at
+every pack), and `expires=never` quiets an expired certificate you keep on purpose. A date
+keyvault cannot read is refused when it is set, and one that got into the catalog anyway is
+listed by `expiring` as unreadable, never taken for "no date".
+
+`keyvault remind` turns reminders on, once. From then on the Reminders list follows the
+vault: renewing a token moves its reminder (and reopens it if you had ticked it off),
+removing one removes it, and reminders keyvault did not make are left alone. iCloud carries
+them to your iPhone. The first time, macOS asks whether your terminal may control Reminders.
+Apple Development certificates get none: Xcode issues a new one by itself when one runs out,
+so `expiring` lists them as Xcode's and never as due.
+
+`expiring` exits 2 when anything is due within 30 days or already past, and so does
+`validate`, so a scheduled check notices too. The catalog flags an item that is due soon,
+and `describe` tells an agent when a key has expired, so it says so instead of failing
+mysteriously.
+
+## Scan: keys left lying around
+
+```bash
+keyvault scan                       # your home folder, iCloud Drive and other cloud drives included
+keyvault scan ~/repo ~/Downloads    # just these
+keyvault scan --transcripts         # also AI agents' conversation logs
+keyvault scan --json                # for scripts and agents
+keyvault scan ignore '~/notes/example.md:generic-api-key:12'   # a false alarm, for good
+```
+
+[gitleaks](https://github.com/gitleaks/gitleaks) recognises the keys: `ghp_` and
+`github_pat_`, `sk-ant-`, `AKIA`, `xoxb-`, PEM private keys and a few hundred more
+(`brew install gitleaks`). keyvault decides what it reads, and what each finding means:
+
+| Found | What it means | What to do |
+|---|---|---|
+| committed to git | in the repository's history for good | rotate it, and store the new one in keyvault |
+| in your shell setup or history | a profile's export reaches every program you start; history keeps what was pasted | `keyvault secret set`, use it with `keyvault secret run`, delete the line |
+| lying around | a note, a download, a `.env` | move it into keyvault, delete the copy |
+| seen by an AI agent | a conversation log holds it | rotate it if it still works |
+| where a tool reads it | `~/.aws/credentials`, a CLI's own config | usually fine; back up what cannot be re-issued |
+| already in keyvault | a file the vault holds | nothing |
+
+It never prints or keeps a value: gitleaks runs with `--redact`, and only the file, line and
+rule leave the scan. Nor does it download anything: a file that iCloud Drive, Google Drive or
+OneDrive keeps only in the cloud is skipped, not read. Caches, build output, dependencies
+(`node_modules`, cargo's `target/`, `DerivedData`), toolchains, editor extensions, files over
+5 MB and `~/Library` (except the cloud drives in it) are left out. Ignored findings live in
+`~/.config/keyvault/scan-ignore`, one per line: a finding's fingerprint (from `--json`), or a
+file or folder. Ignoring a committed finding ignores its copies in the repository's other
+worktrees too.
+
+`scan` exits 2 when it finds something to act on. A tool's own config and a file the vault
+holds are where they belong, so they don't count. Next to the vault, only keyvault's own files
+(the sealed store, the archive, `catalog.json`) are taken as its own: a plaintext key in the
+same folder is reported like any other. To tell committed from uncommitted, it asks `git` in
+the repositories it finds, downloaded ones included, with `core.fsmonitor` switched off: that
+is the setting through which a repository's own config could make git run a program.
+
+## Checkup: what needs doing, without remembering to look
+
+```bash
+keyvault checkup              # everything below, now (exit 2 when something needs doing)
+keyvault checkup --no-scan    # the same in a second, without the scan
+keyvault schedule on          # weekly: Mondays at 10:00, or at the next wake; off | status
+```
+
+Everything that goes through keyvault keeps itself current: a new date moves its reminder at
+once. What changes behind its back is what the checkup looks for:
+
+- dates that are past, due within 30 days, or unreadable
+- certificates in the keychain the vault lacks: Xcode renewed one, and it takes a `pack` to
+  back it up (compared by fingerprint, without exporting, so it never raises a prompt)
+- Reminders behind the vault, after an update that did not get through
+- keys that turned up in files since the last checkup. A finding is its file and rule, so an
+  edit above it does not make it new again; the first checkup only records what is there.
+
+`schedule on` installs a launchd agent (`~/Library/LaunchAgents/keyvault.checkup.plist`) that
+runs this checkout's `keyvault checkup --notify` under `/bin/bash`, with the PATH it was
+scheduled from, and posts a notification when there is something to do. It only reads: it
+never unlocks the vault, exports from the keychain or writes to Reminders. Its log is
+`~/.local/state/keyvault/checkup.log`. Run by launchd, it is `/bin/bash` that reads your
+folders, and macOS may ask once whether it may read Documents, Desktop, Downloads and
+iCloud Drive; a folder it is refused is named in the log, not silently skipped.
+
 ## Guardrails
 
 Permission rules and a sandbox, so that "agents can't just read the key files" is enforced
@@ -322,11 +421,15 @@ sandbox holds against that. Rules still stop the accidental read, which is the c
 ```
 keyvault init | setup | edit | doctor | status | card | recovery-check
 keyvault pack [--refresh] | list | verify | validate
-keyvault secret set NAME [--ask] | rm NAME | backup | run NAME -- <cmd…> | list
-keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--meta k=v] [--restore-to P]
+keyvault secret set NAME [--ask] [--expires D] | expires NAME D | rm NAME | backup | run NAME -- <cmd…> | list
+keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--expires D] [--meta k=v] [--restore-to P]
 keyvault remove <id> | show <id> --out PATH
 keyvault restore [--only ID] [--force] [--apply]
     reading commands also take --recovery (the paper key) and --via DEVICE
+
+keyvault expiring [--within DAYS] [--json] | remind [off | status]
+keyvault scan [PATH…] [--transcripts] [--json] | scan ignore <FILE:RULE:LINE | PATH>
+keyvault checkup [--no-scan] [--notify] | schedule on | off | status
 
 keyvault catalog | find <text> | describe <id>    asks for nothing, shows no secrets
 keyvault request <id>… --reason T [--ttl 30m] [--run -- <cmd…>]
@@ -343,6 +446,8 @@ keyvault grants | revoke <grant> | --all
 | `KEYVAULT_UNLOCK_VIA` | default for `--via` (default `mac`) |
 | `KEYVAULT_SPARKLE_BIN` | directory holding Sparkle's `generate_keys` and `sign_update` (found in DerivedData otherwise) |
 | `KEYVAULT_ARCHIVE_KEEP` | earlier versions to keep (default 10) |
+| `KEYVAULT_EXPIRY_WARN_DAYS` | how soon counts as "expiring" for `expiring` and `validate` (default 30) |
+| `KEYVAULT_REMIND_DAYS` | how long before a date its reminder is due (default 14) |
 | `SECRET_KEYCHAIN` | keychain for `secret` (default: login) |
 
 The test suite also uses `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY` and
@@ -361,8 +466,9 @@ the Mac never waits on a Touch ID sensor you are nowhere near.
 ## Design notes
 
 - **Bash 3.2.** That is what stock macOS ships, and the machine you are restoring onto will
-  not have Homebrew yet. `keyvault` is one file for the same reason; the agent features live
-  in `keyvault-access.sh`, which recovery never needs.
+  not have Homebrew yet. `keyvault` is one file for the same reason. The agent features live
+  in `keyvault-access.sh`, and scan, checkup and schedule in `keyvault-watch.sh` (with
+  `keyvault-scan.py`): recovery never needs either.
 - **Three factors, one of them on paper.** The recovery key never touches a computer, so
   stealing your passphrase or your Mac is not enough on its own.
 - **Say what you left out.** A config that records, in comments, what was considered and

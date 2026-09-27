@@ -71,17 +71,32 @@ catalog_require() {
 # an older one (stale) or none. A token's copy is shown as the token, not twice.
 tokens_items() {
     local copies
-    copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // "")}]' "$KV_CATALOG" 2>/dev/null)"
+    copies="$(jq -c '[.items[]? | select(.meta.token) | {t: .meta.token, c: (.meta.changed // ""),
+        e: (.meta.expires // "" | if test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$") then . else "" end)}]' "$KV_CATALOG" 2>/dev/null)"
     [[ -n $copies ]] || copies='[]'
     tokens_list | jq -c --argjson b "$copies" 'map(. as $k | {id: .name, type: "token", kind: "token",
         level: (if .ask then "ask" elif .plain then "plain" else "run" end), desc}
         + (if .plain then {value} else {} end) + {
         backup: (if any($b[]; .t == $k.name and .c == ($k.changed // "")) then "current"
-                 elif any($b[]; .t == $k.name) then "stale" else "none" end)})'
+                 elif any($b[]; .t == $k.name) then "stale" else "none" end)}
+        + (first($b[] | select(.t == $k.name and .e != "" and .e != "never") | {expires: .e}) // {}))'
 }
+# When a vault item stops working, as YYYY-MM-DD: its --expires, else its certificate's
+# not_after, else the first of its keychain identities to run out. A date that cannot be
+# read is left out here (keyvault expiring reports it); run under LC_ALL=C, as %b is English.
+KV_JQ_EXPIRES='
+    def kv_ymd: try (strptime("%b %d %H:%M:%S %Y GMT") | mktime | strftime("%Y-%m-%d")) catch null;
+    def kv_iso: select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+                       and ((try (strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")) catch null) == .));
+    def kv_expires: (.meta.expires // "") as $s
+        | if $s == "never" then null elif $s != "" then ([$s | kv_iso] | first)
+          elif .meta.not_after then (.meta.not_after | kv_ymd)
+          elif .certs then ([.certs[]? | .not_after // empty | kv_ymd // empty] | min)
+          else null end;'
 all_items() {   # every item an agent may know about, vault first
     local vault='[]'
-    [[ -f $KV_CATALOG ]] && vault="$(jq -c '[.items // [] | .[] | select(.meta.token | not)]' "$KV_CATALOG")"
+    [[ -f $KV_CATALOG ]] && vault="$(LC_ALL=C jq -c "$KV_JQ_EXPIRES"'[.items // [] | .[] | select(.meta.token | not)
+        | . + (kv_expires as $x | if $x then {expires: $x} else {} end)]' "$KV_CATALOG")"
     jq -nc --argjson v "$vault" --argjson t "$(tokens_items)" '$v + $t'
 }
 something_require() {
@@ -170,7 +185,11 @@ grants_sweep() {
 }
 
 item_line() {   # one catalog item -> one line of the table
-    jq -r '
+    jq -r --arg today "$(kv_today)" --argjson warn "$KV_EXPIRY_WARN_DAYS" '
+        def day: strptime("%Y-%m-%d") | mktime;
+        def soon: if .expires then ((((.expires | day) - ($today | day)) / 86400) | floor) as $d
+                  | if $d < 0 then "EXPIRED \(.expires) · " elif $d <= $warn then "expires in \($d) d · " else "" end
+                  else "" end;
         def facts:
             if .kind == "asc-api-key" then "key \(.meta.asc_key_id)" + (if .meta.issuer_id then "  issuer \(.meta.issuer_id)" else "" end)
             elif .type == "sparkle" then "ed25519 \(.public_key)"
@@ -181,7 +200,7 @@ item_line() {   # one catalog item -> one line of the table
             elif .meta.age_recipient then .meta.age_recipient
             elif .path then .path
             else "" end;
-        [.id, (.level // "?"), .kind, facts] | @tsv' <<<"$1" \
+        [.id, (.level // "?"), .kind, soon + facts] | @tsv' <<<"$1" \
     | awk -F'\t' '{ printf "%-38s %-11s %-20s %s\n", $1, $2, $3, (length($4) > 50 ? substr($4, 1, 47) "..." : $4) }'
 }
 
@@ -224,6 +243,13 @@ cmd_describe() {
     local it; it="$(all_items | jq -c --arg id "$1" 'first(.[] | select(.id == $id)) // empty')"
     [[ -n $it ]] || die "no item '$1' in the catalog (keyvault find <text>)"
     jq . <<<"$it"
+    local x; x="$(jq -r '.expires // ""' <<<"$it")"
+    if [[ -n $x ]]; then
+        local d; d="$(days_until "$x")"
+        say ""
+        if (( d < 0 )); then say "Expired $x ($(when_text "$d")): it no longer works. Tell the user; do not use it."
+        else say "Expires $x ($(when_text "$d"))."; fi
+    fi
     if [[ $(jq -r '.type' <<<"$it") == token ]]; then
         say ""
         if [[ $(jq -r '.level' <<<"$it") == plain ]]; then
@@ -360,14 +386,30 @@ end run
 AS
 }
 
+# When it stops working, asked right after the value: the user has just made the token and
+# knows. Prefilled with the date it had, so a replacement only needs confirming.
+expiry_dialog() {   # expiry_dialog <name> <prefill> [what was not understood] -> what the user typed, "" to skip
+    if [[ -n ${KEYVAULT_DIALOG:-} ]]; then "$KEYVAULT_DIALOG" --expires "$@"; return; fi   # tests
+    osascript - "$1" "$2" "${3:-}" <<'AS' 2>/dev/null
+on run argv
+    set msg to "When does " & item 1 of argv & " stop working?" & return & return & "A date (2026-12-01), a span from today (90d, 6m, 1y) or never. keyvault reminds you before it does."
+    if item 3 of argv is not "" then set msg to "Not understood: " & item 3 of argv & return & return & msg
+    set r to display dialog msg with title "keyvault" default answer (item 2 of argv) buttons {"Skip", "Save"} default button 2 cancel button 1 giving up after 300
+    if gave up of r then return ""
+    return text returned of r
+end run
+AS
+}
+
 secret_request() {
     local sb="$1"; shift
-    (($#)) || die "usage: keyvault secret request NAME --desc \"what it is, what it is for\""
+    (($#)) || die "usage: keyvault secret request NAME --desc \"what it is, what it is for\" [--expires DATE]"
     local name="$1"; shift
-    local desc="" by out button v ask replaces=""
+    local desc="" by out button v ask replaces="" exp="" e tries=0
     while (($#)); do
         case "$1" in
             --desc) desc="$2"; shift 2 ;;
+            --expires) exp="$(expiry_or_die "${2:-}")" || exit 1; shift 2 ;;
             *) die "secret request: unknown option '$1'" ;;
         esac
     done
@@ -383,7 +425,14 @@ secret_request() {
     button="${out%%$'\n'*}"; v=""; [[ $out == *$'\n'* ]] && v="${out#*$'\n'}"; out=""
     [[ -n $v ]] || { audit "token-request $name by=$by empty"; die "nothing was entered"; }
     [[ $button == "Agents may use it" ]] && ask=0 || ask=1
-    token_store "$sb" "$name" "$ask" "$desc" "$v"; local rc=$?
+    local prefill; prefill="$(token_expires "$name")"
+    while [[ -z $exp ]] && (( tries++ < 3 )); do
+        e="$(expiry_dialog "$name" "$prefill" "${e:-}")" || break
+        [[ -z $e ]] && break
+        exp="$(expiry_parse "$e")" || prefill="$e"
+    done
+    [[ -z $exp ]] && exp="$(token_expires "$name")"
+    token_store "$sb" "$name" "$ask" "$desc" "$v" 0 "$exp"; local rc=$?
     v=""
     (( rc )) && { audit "token-request $name by=$by failed"; return 1; }
     audit "token-request $name by=$by stored$( ((ask)) && echo ' ask')"
