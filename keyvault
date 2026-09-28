@@ -336,10 +336,10 @@ threading_call() {   # threading_call <json-line> -> Threading's one-line reply
 threading_refusal() {   # threading_refusal <reply> -> why, in words
     case "$(printf '%s' "$1" | jq -r '.error // "refused"' 2>/dev/null)" in
         denied)       echo "denied on the iPhone" ;;
-        expired)      echo "not approved in time — ask again" ;;
+        expired)      echo "not approved within 2 minutes — ask again, and open Threading › Settings › Security › Face ID Approvals on the iPhone" ;;
         busy)         echo "the iPhone is still deciding on another request" ;;
         disabled)     echo "Face ID approvals are off in Threading" ;;
-        not-enrolled) echo "no iPhone is enrolled in Threading → Remote Access → Face ID Approvals" ;;
+        not-enrolled) echo "no iPhone is enrolled: Threading › Settings › Remote Access › Face ID Approvals on the Mac" ;;
         wrong-device) echo "the iPhone was changed or forgotten — run 'keyvault device add iphone' again" ;;
         *)            echo "Threading refused the request" ;;
     esac
@@ -352,7 +352,9 @@ factor_unlock_iphone() {   # factor_unlock_iphone <out>
     lines="$(printf '%s\n' ${KV_ASK_LINES[@]+"${KV_ASK_LINES[@]}"} | grep . | jq -R . | jq -sc .)"
     request="$(jq -nc --arg t "${KV_ASK_TITLE:-keyvault ${KV_COMMAND:-}}" --argjson l "$lines" \
         --slurpfile e "$envelope" '{op:"unwrap", client:"keyvault", title:$t, lines:$l, envelope:$e[0]}')"
-    info "  ${C_BOLD}iPhone${C_RESET}: approve it with Face ID in Threading → Settings → Face ID Approvals"
+    # Say exactly where the request is and how long it waits: "nothing happens" was the first
+    # report from someone who did not know the phone had a request to find.
+    info "  ${C_BOLD}Waiting for your iPhone${C_RESET} (2 minutes): open the notification, or Threading › Settings › Security › Face ID Approvals, and approve with Face ID"
     reply="$(threading_call "$request")" || die "could not reach Threading"
     [[ "$(printf '%s' "$reply" | jq -r '.ok' 2>/dev/null)" == true ]] \
         || die "the iPhone did not open the biometric key: $(threading_refusal "$reply")"

@@ -1044,6 +1044,10 @@ grep -q 'iphone' <<<"$(kv status 2>&1)" && ok "status lists the iPhone" || no "s
 
 phone approve
 check "show --via iphone opens a biometric item without Touch ID" "$(viaphone show beta --stdout --via iphone 2>/dev/null)" "PRIVATE-KEY-BETA"
+# "Nothing happens" was the first report: the phone had a request, and nobody said where to find it.
+out="$(viaphone show beta --stdout --via iphone 2>&1 >/dev/null)"
+grep -q 'Waiting for your iPhone (2 minutes)' <<<"$out" && grep -q 'Settings › Security › Face ID Approvals' <<<"$out" \
+    && ok "while it waits, it says where the request is and for how long" || no "while it waits, it says where the request is and for how long" "$out"
 check "the phone is told what is asked" "$(asked .client)" "keyvault"
 grep -q 'show' <<<"$(asked .title)" && ok "and which command asks" || no "and which command asks" "$(asked .title)"
 phone deny
