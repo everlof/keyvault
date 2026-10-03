@@ -1457,6 +1457,14 @@ grep -q 'off' <<<"$(sch status 2>&1)" && ok "and status says so" || no "and stat
 
 # ---------------------------------------------------------------------------- ramdisk
 
+group "required RAM disk never falls back to plaintext on disk"
+out="$(KEYVAULT_REQUIRE_RAMDISK=1 KEYVAULT_NO_RAMDISK=1 KEYVAULT_MOUNT="$WORK/forbidden-fallback" \
+       KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; workspace_create" 2>&1)"; rc=$?
+[[ $rc != 0 ]] && ok "required RAM disk fails when unavailable" || no "required RAM disk fails when unavailable"
+[[ ! -e $WORK/forbidden-fallback ]] && ok "required RAM disk never creates a disk workspace" \
+    || no "required RAM disk never creates a disk workspace"
+grep -q 'disk fallback is disabled' <<<"$out" && ok "the caller gets the reason" || no "the caller gets the reason" "$out"
+
 group "RAM-disk workspace (the real path, not the fallback)"
 if [[ $(uname) == Darwin ]]; then
     out="$(KEYVAULT_NO_RAMDISK=0 KEYVAULT_MOUNT=/Volumes/keyvault-selftest \

@@ -470,6 +470,7 @@ keyvault grants | revoke <grant> | --all
 | `KEYVAULT_ARCHIVE_KEEP` | earlier versions to keep (default 10) |
 | `KEYVAULT_EXPIRY_WARN_DAYS` | how soon counts as "expiring" for `expiring` and `validate` (default 30) |
 | `KEYVAULT_REMIND_DAYS` | how long before a date its reminder is due (default 14) |
+| `KEYVAULT_REQUIRE_RAMDISK` | `1` refuses disk fallback if a RAM workspace cannot be mounted (for GUI clients) |
 | `SECRET_KEYCHAIN` | keychain for `secret` (default: login) |
 
 The test suite also uses `KEYVAULT_SE_IDENTITY`, `KEYVAULT_PASSPHRASE_IDENTITY` and

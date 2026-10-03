@@ -461,6 +461,9 @@ workspace_create() {   # workspace_create [mount] [sectors] [pinned]  -> "<mount
         fi
     fi
     [[ -n $dev ]] && hdiutil detach "$dev" >/dev/null 2>&1
+    # GUI clients cannot surface the fallback warning before plaintext hits disk.
+    [[ ${KEYVAULT_REQUIRE_RAMDISK:-0} == 1 ]] \
+        && die "could not create a RAM disk; disk fallback is disabled for this caller"
     local tmp
     if (( pinned )); then
         # An explicit mount point is honoured on both paths, so a caller that pins one
