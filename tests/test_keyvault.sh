@@ -200,6 +200,9 @@ out="$(onpty $'WRONG1\n'"$LAST6"$'\n' "$SHELL_BIN" "$KV" setup 2>&1)"; rc=$?
 check "setup succeeds through a terminal" "$rc" "0"
 grep -q "${RECOVERY_SECRET:0:16}" <<<"$out" && ok "it shows the recovery key once, to write down" || no "it shows the recovery key once, to write down" "$out"
 grep -q 'does not match' <<<"$out" && ok "a wrong confirmation is caught" || no "a wrong confirmation is caught" "$out"
+if [[ $(uname) == Darwin ]]; then
+    grep -q '█' <<<"$out" && ok "and shows it as a QR code beside the text" || no "and shows it as a QR code beside the text"
+fi
 check "three public keys are recorded" "$(grep -c '^[a-z]* age1' "$KEYVAULT_KEYS/recipients")" "3"
 for f in biometric.mac.age passphrase.key.age; do
     [[ -f $KEYVAULT_KEYS/$f ]] && ok "keys/$f exists" || no "keys/$f exists"
@@ -224,6 +227,86 @@ check "lower case and spaces are forgiven" "$?" "0"
 typed "$RECOVERY_SECRET" >/dev/null
 check "the whole key still works" "$?" "0"
 grep -q 'not an age secret key' <<<"$(typed "NOT A KEY AT ALL")" && ok "something that is not a key is refused" || no "something that is not a key is refused"
+
+# ---------------------------------------------------------------------------- recovery key QR
+
+group "the recovery key as a QR code: printed, and read back by the camera"
+if [[ $(uname) == Darwin ]] && command -v osascript >/dev/null; then
+    # The terminal's code is the generator's: undo the half blocks, module for module.
+    matrix="$(printf '%s' "$RECOVERY_SECRET" | KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; qr_load && qr_matrix")"
+    rendered="$(printf '%s\n' "$matrix" | KEYVAULT_LIB=1 "$SHELL_BIN" -c "source '$KV'; qr_load && qr_render")"
+    back="$(printf '%s\n' "$rendered" | python3 -c '
+import re, sys
+lines = [re.sub(r"\x1b\[[0-9;]*m", "", l.rstrip("\n"))[6:] for l in sys.stdin if l.strip()]
+top = {"█": "1", "▀": "1", "▄": "0", " ": "0"}
+bottom = {"█": "1", "▀": "0", "▄": "1", " ": "0"}
+rows = []
+for line in lines:
+    rows.append("".join(top[c] for c in line)); rows.append("".join(bottom[c] for c in line))
+n = int(sys.argv[1]); pad = 3
+print("\n".join(r[pad:-pad] for r in rows[pad:pad + n]))' "$(grep -c . <<<"$matrix")")"
+    [[ -n $matrix && $back == "$matrix" ]] && ok "the code on the terminal is the generator's, module for module" \
+        || no "the code on the terminal is the generator's, module for module" "$(head -3 <<<"$back")"
+
+    printf '#!/bin/bash\ngrep "^AGE-SECRET-KEY-" "%s"\n' "$WORK/recovery.id" > "$WORK/reader-right"
+    printf '#!/bin/bash\ngrep "^AGE-SECRET-KEY-" "%s"\n' "$WORK/wrong.id" > "$WORK/reader-wrong"
+    printf '#!/bin/bash\nexit 1\n' > "$WORK/reader-none"
+    chmod +x "$WORK"/reader-*
+    cam() { env -u KEYVAULT_RECOVERY_IDENTITY KEYVAULT_QR_READER_BIN="$1" "${NOTTY[@]}" "$SHELL_BIN" "$KV" recovery-check --camera 2>&1; }
+    out="$(cam "$WORK/reader-right")"; rc=$?
+    check "recovery-check --camera reads the key off its QR code" "$rc" "0"
+    out="$(cam "$WORK/reader-wrong")"; rc=$?
+    [[ $rc != 0 ]] && grep -q 'not the recovery key' <<<"$out" && ok "a code for another key is refused" || no "a code for another key is refused" "$out"
+    out="$(cam "$WORK/reader-none")"; rc=$?
+    [[ $rc != 0 ]] && grep -q 'no QR code was read' <<<"$out" && ok "nothing read says so" || no "nothing read says so" "$out"
+
+    printf '#!/bin/bash\ngrep "^AGE-SECRET-KEY-" "%s"\n' "$WORK/recovery.id" > "$WORK/clip-paste"
+    printf '#!/bin/bash\ncat >/dev/null\necho cleared >> "%s"\n' "$WORK/clip-cleared" > "$WORK/clip-clear"
+    chmod +x "$WORK"/clip-*; rm -f "$WORK/clip-cleared"
+    out="$(env -u KEYVAULT_RECOVERY_IDENTITY KEYVAULT_CLIPBOARD_BIN="$WORK/clip-paste" KEYVAULT_CLIPBOARD_CLEAR_BIN="$WORK/clip-clear" \
+           "${NOTTY[@]}" "$SHELL_BIN" "$KV" recovery-check --paste 2>&1)"; rc=$?
+    check "--paste takes it from the clipboard (an iPhone's Camera app, copied)" "$rc" "0"
+    [[ -s $WORK/clip-cleared ]] && ok "and empties the clipboard after" || no "and empties the clipboard after"
+
+    out="$(env -u KEYVAULT_RECOVERY_IDENTITY KEYVAULT_QR_READER_BIN="$WORK/reader-right" \
+           python3 "$ROOT/tests/onpty.py" $'\n' "$SHELL_BIN" "$KV" recovery-check 2>&1)"; rc=$?
+    grep -q 'Enter alone scans its QR code' <<<"$out" && ok "the prompt says Enter alone scans the code" || no "the prompt says Enter alone scans the code" "$out"
+    check "and Enter alone does" "$rc" "0"
+
+    # --qr: once the key is proven, its code on screen and, asked for, a printed sheet (a PDF here).
+    rm -f "$WORK/sheet.pdf"
+    out="$(KEYVAULT_QR_SHEET_PDF="$WORK/sheet.pdf" python3 "$ROOT/tests/onpty.py" $'y\n\n' "$SHELL_BIN" "$KV" recovery-check --qr 2>&1)"; rc=$?
+    check "recovery-check --qr exits 0" "$rc" "0"
+    grep -q '█' <<<"$out" && ok "it shows the checked key as a QR code" || no "it shows the checked key as a QR code" "$out"
+    [[ $(wc -c < "$WORK/sheet.pdf" 2>/dev/null || echo 0) -gt 10000 ]] && ok "and prints a recovery sheet when asked" || no "and prints a recovery sheet when asked" "$out"
+
+    # The whole loop with the real camera reader, a picture of that printed sheet held up to it.
+    if xcode-select -p >/dev/null 2>&1 && command -v swiftc >/dev/null && sips -s format png "$WORK/sheet.pdf" --out "$WORK/sheet.png" >/dev/null 2>&1; then
+        out="$(env -u KEYVAULT_RECOVERY_IDENTITY KEYVAULT_QR_READER_IMAGE="$WORK/sheet.png" "${NOTTY[@]}" "$SHELL_BIN" "$KV" recovery-check --camera 2>&1)"; rc=$?
+        check "the camera reader reads the printed sheet back as the right key" "$rc" "0"
+        # A window that reads nothing writes nothing: keyvault must stop waiting, and say why.
+        sips -z 8 8 "$WORK/sheet.png" --out "$WORK/no-qr.png" >/dev/null 2>&1
+        out="$(env -u KEYVAULT_RECOVERY_IDENTITY KEYVAULT_QR_READER_IMAGE="$WORK/no-qr.png" "${NOTTY[@]}" "$SHELL_BIN" "$KV" recovery-check --camera 2>&1)"; rc=$?
+        [[ $rc != 0 ]] && grep -q 'no recovery key QR code in that picture' <<<"$out" \
+            && ok "a reader that finds nothing ends the wait, and says why" \
+            || no "a reader that finds nothing ends the wait, and says why" "$out"
+        app="$(find "$KEYVAULT_STATE/qr-reader" -name '*.app' -maxdepth 2 | head -1)"
+        [[ -n $app ]] && grep -q 'NSCameraUsageDescription' "$app/Contents/Info.plist" && codesign --verify "$app" 2>/dev/null \
+            && ok "built as an app of its own, signed, asking for the camera in its own name" \
+            || no "built as an app of its own, signed, asking for the camera in its own name" "$app"
+    else
+        printf '  %s· the camera reader needs Xcode'"'"'s tools; skipped%s\n' "$D" "$Z"
+    fi
+
+    # Without keyvault-qr.sh, recovery still works by typing, and --camera says what is missing.
+    mkdir -p "$WORK/bare"; cp "$KV" "$WORK/bare/keyvault"
+    out="$(env -u KEYVAULT_RECOVERY_IDENTITY "${NOTTY[@]}" "$SHELL_BIN" "$WORK/bare/keyvault" recovery-check --camera 2>&1)"; rc=$?
+    [[ $rc != 0 ]] && grep -q 'needs keyvault-qr.sh' <<<"$out" && ok "a copy without keyvault-qr.sh says what --camera needs" || no "a copy without keyvault-qr.sh says what --camera needs" "$out"
+    env -u KEYVAULT_RECOVERY_IDENTITY python3 "$ROOT/tests/onpty.py" "$RECOVERY_SECRET"$'\n' "$SHELL_BIN" "$WORK/bare/keyvault" recovery-check >/dev/null 2>&1
+    check "and still checks a typed key" "$?" "0"
+else
+    printf '  %s· skipped (not macOS)%s\n' "$D" "$Z"
+fi
 
 # ---------------------------------------------------------------------------- lifecycle
 

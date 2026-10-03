@@ -12,7 +12,9 @@ This is the source of keyvault. To *use* keyvault as an agent (find a key, ask f
   restored onto has only stock macOS. Run both test modes.
 - **`keyvault` stays one file** and must restore a dead machine on its own. Agent features go
   in `keyvault-access.sh`, watching the machine (scan, checkup, schedule) in
-  `keyvault-watch.sh`; recovery must never need them.
+  `keyvault-watch.sh`, the recovery key's QR code (show, print, camera, clipboard) in
+  `keyvault-qr.sh` with its camera app in `tools/qr-reader.swift`; recovery must never need
+  them, and typing the key must always work without them.
 - **Plaintext only on the RAM disk.** Never write a decrypted key anywhere else, including a
   temp file "just for a moment".
 - **Every bug fix gets a regression test,** named for what it protects.

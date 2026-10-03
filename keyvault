@@ -80,6 +80,7 @@ readonly KV_ARCHIVE_KEEP="${KEYVAULT_ARCHIVE_KEEP:-10}"
 readonly KV_LEVELS="biometric passphrase both"
 KV_LEVEL_DEFAULT="biometric"                 # `level` in the config changes it
 KV_RECOVERY=0                                # --recovery: open with the paper key instead
+KV_RECOVERY_INPUT=type                       # --camera / --paste: how that key comes in
 # Which device unlocks the biometric factor. One key, wrapped once per device, so adding a
 # device never means re-encrypting the vault.
 KV_VIA="${KEYVAULT_UNLOCK_VIA:-mac}"
@@ -287,16 +288,7 @@ factor_unlock() {   # factor_unlock <biometric|passphrase|recovery>
             if [[ -n ${KEYVAULT_RECOVERY_IDENTITY:-} ]]; then
                 ( umask 077; cp "$KEYVAULT_RECOVERY_IDENTITY" "$out" ) || die "cannot read $KEYVAULT_RECOVERY_IDENTITY"
             else
-                { exec 4</dev/tty; } 2>/dev/null || die "the recovery key needs a human at a terminal"
-                local k
-                printf 'Recovery key (AGE-SECRET-KEY-1…, not echoed): ' >/dev/tty
-                IFS= read -rs k <&4; printf '\n' >/dev/tty; exec 4<&-
-                # Typed from paper: forgive spaces, line breaks, lower case, and leaving out the
-                # AGE-SECRET-KEY-1 the card prints for you. Bech32 data never holds a '1', so
-                # a leading one can only be the prefix's.
-                k="$(printf '%s' "$k" | tr -d ' \t\r\n-' | tr '[:lower:]' '[:upper:]')"
-                k="${k#AGESECRETKEY}"; k="AGE-SECRET-KEY-1${k#1}"
-                ( umask 077; printf '%s\n' "$k" > "$out" )
+                recovery_read "$out"
             fi
             age-keygen -y "$out" >/dev/null 2>&1 \
                 || { rm -f "$out"; die "that is not an age secret key — check each character against the card"; }
@@ -306,6 +298,44 @@ factor_unlock() {   # factor_unlock <biometric|passphrase|recovery>
             fi
             ;;
     esac
+}
+
+# The recovery key from a person: typed from the card; or, with keyvault-qr.sh beside this file,
+# read off the sheet's QR code by the camera (--camera, or Enter alone at the prompt) or taken
+# from the clipboard (--paste). Whichever way it came, it lands in <out> on the RAM disk.
+recovery_read() {   # recovery_read <out>
+    local out="$1" k="" how="$KV_RECOVERY_INPUT" hint=""
+    if [[ $how == type ]]; then
+        { exec 4</dev/tty; } 2>/dev/null || die "the recovery key needs a human at a terminal"
+        qr_load && qr_can_read && hint="; Enter alone scans its QR code"
+        printf 'Recovery key (AGE-SECRET-KEY-1…, not echoed%s): ' "$hint" >/dev/tty
+        IFS= read -rs k <&4; printf '\n' >/dev/tty; exec 4<&-
+        [[ -z $k && -n $hint ]] && how=camera
+    fi
+    if [[ $how != type ]]; then
+        qr_load || die "reading the key by $how needs keyvault-qr.sh beside keyvault — type it instead"
+        case "$how" in
+            camera) qr_read "$out" ;;
+            paste)  clipboard_read "$out" ;;
+        esac || die "no recovery key was read — try again, or type it"
+        k="$(cat "$out")"
+    fi
+    # Typed from paper: forgive spaces, line breaks, lower case, and leaving out the
+    # AGE-SECRET-KEY-1 the card prints for you. Bech32 data never holds a '1', so a leading one
+    # can only be the prefix's. A scanned or pasted key passes through unchanged.
+    k="$(printf '%s' "$k" | tr -d ' \t\r\n-' | tr '[:lower:]' '[:upper:]')"
+    k="${k#AGESECRETKEY}"; k="AGE-SECRET-KEY-1${k#1}"
+    ( umask 077; printf '%s\n' "$k" > "$out" )
+    k=""
+}
+
+# The QR code half of recovery lives in its own file: a stripped-down copy of keyvault without
+# it still restores a dead machine, by typing.
+qr_load() {
+    [[ -n ${KV_QR_LOADED:-} ]] && return 0
+    [[ -f $KV_ROOT/keyvault-qr.sh ]] || return 1
+    # shellcheck source=keyvault-qr.sh
+    source "$KV_ROOT/keyvault-qr.sh" && KV_QR_LOADED=1
 }
 
 # ---------------------------------------------------------------------------- iPhone
@@ -1565,6 +1595,8 @@ cmd_show() {
 open_opt() {   # open_opt "$1" "$2" -> how many args it consumed (0 if not an open option)
     case "$1" in
         --recovery) KV_RECOVERY=1; return 1 ;;
+        --camera)   KV_RECOVERY=1; KV_RECOVERY_INPUT=camera; return 1 ;;   # its QR code, by camera
+        --paste)    KV_RECOVERY=1; KV_RECOVERY_INPUT=paste; return 1 ;;    # from the clipboard
         --via)      [[ -n ${2:-} ]] || die "--via needs a device name"; KV_VIA="$2"; return 2 ;;
     esac
     return 0
@@ -2017,7 +2049,7 @@ cmd_card() {
       done
       rm -f x y /tmp/r.txt      # vault-*/manifest.json says what is where; rm -rf /tmp/kv when done
 
-  Or with keyvault installed:   keyvault restore --recovery
+  Or with keyvault installed:   keyvault restore --recovery   (--camera reads the QR code on your sheet)
 
   WHAT IS INSIDE
 
@@ -2526,11 +2558,12 @@ EOF
 # once, to be written down, and never stored.
 
 cmd_setup() {
-    local ac="any-biometry-or-passcode" force=0 recovery=0
+    local ac="any-biometry-or-passcode" force=0 recovery=0 print=0
     while (($#)); do
         case "$1" in
             --access-control) ac="$2"; shift 2 ;;
             --force)          force=1; shift ;;
+            --print)          print=1; shift ;;
             --recovery)       recovery=1; shift ;;
             *) die "setup: unknown option '$1'" ;;
         esac
@@ -2621,6 +2654,11 @@ cmd_setup() {
       ${C_BOLD}$(printf '%s' "$secret" | sed 's/.\{16\}/& /g')${C_RESET}
 
 EOF
+    # The same key as a QR code, for the sheet you print: 'keyvault recovery-check --camera'
+    # reads it back. Cleared with the rest of the screen below.
+    if qr_load && qr_show "$secret" && (( print )); then
+        if qr_print "$secret"; then ok "sent to the printer"; else warn "not printed"; fi
+    fi
     local tail="${secret: -6}" answer
     while :; do
         printf '  Type its last 6 characters to confirm you have it: ' >/dev/tty
@@ -2670,12 +2708,28 @@ EOF
 }
 
 cmd_recovery_check() {
+    local qr=0 n
+    while (($#)); do
+        case "$1" in
+            --qr) qr=1; shift ;;
+            *) open_opt "$@"; n=$?
+               (( n )) || die "usage: keyvault recovery-check [--camera | --paste] [--qr]"
+               shift "$n" ;;
+        esac
+    done
     have age-keygen || die "age is not installed"
     keys_require
     KV_RECOVERY=1
     ws_open
     factor_unlock recovery      # compares against the recorded public key, and dies if it differs
     ok "that is the right recovery key"
+    # Checked, so worth printing: the QR code of the key just proven right, and a sheet with it.
+    if (( qr )); then
+        qr_load || die "--qr needs keyvault-qr.sh beside keyvault"
+        local key; key="$(grep '^AGE-SECRET-KEY-' "$(factor_path recovery)")"
+        qr_offer "$key"
+        key=""
+    fi
 }
 
 # ---------------------------------------------------------------------------- init
@@ -2704,6 +2758,7 @@ ${C_BOLD}SETTING UP${C_RESET}
   setup                       create the keys: biometric (Touch ID), passphrase, recovery (paper)
                               a vault already there moves to them: on a new Mac its old recovery key
                               opens it; setup --force replaces keys the same way (--recovery: paper key)
+                              the new recovery key is shown as text and a QR code; --print: a sheet
   doctor                      check tools, keys, config and every declared source
 
 ${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passphrase · both
@@ -2713,7 +2768,9 @@ ${C_BOLD}BUILDING AND CHECKING THE VAULT${C_RESET}   levels: biometric · passph
   verify                      is the vault internally sound?
   validate                    does it still match this machine?  (exit 2: out of date)
   card                        a printable recovery sheet
-  recovery-check              is the key on your paper the right one?
+  recovery-check [--camera | --paste] [--qr]
+                              is the key on your paper the right one? --camera reads the QR code on
+                              your recovery sheet; --qr then shows the key as one, to print a sheet
   device add|remove iphone    let a paired iPhone's Face ID open the biometric key, through Threading
 
 ${C_BOLD}CHANGING WHAT IS IN IT${C_RESET}
@@ -2753,7 +2810,8 @@ ${C_BOLD}WHAT NEEDS DOING — without having to remember to look${C_RESET}
 ${C_BOLD}PUTTING IT BACK${C_RESET}
   restore [--only ID] [--force] [--apply]     dry run unless --apply
 
-  Reading commands accept --recovery (open with the paper key: a new Mac) and
+  Reading commands accept --recovery (open with the paper key: a new Mac; --camera or --paste
+  to read it off its QR code instead of typing it) and
   --via DEVICE (which device unlocks the biometric key: mac, the default, or iphone).
 
 ${C_BOLD}FOR AGENTS — WHAT EXISTS (asks for nothing, no secrets)${C_RESET}

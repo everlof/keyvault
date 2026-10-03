@@ -80,6 +80,19 @@ the passphrase key. Every layer is also encrypted to the recovery key.
 written to disk. `keyvault card` prints a sheet to write it on, and `keyvault
 recovery-check` tells you later whether the paper copy is right.
 
+**The recovery key as a QR code.** `setup` shows it as a QR code beside the text, and `setup
+--print` prints a recovery sheet: the code, the key in groups of four, and how to check it. For a
+key you already have on paper, `keyvault recovery-check --qr` checks it first, then shows its code
+and offers the sheet. Reading it back needs no typing: `recovery-check --camera` (and `--camera`
+wherever `--recovery` goes) opens a small camera window that reads the sheet, and Enter alone at
+the key prompt does the same. The window is its own little app, built once from
+`tools/qr-reader.swift` with Xcode's tools, so macOS asks for the camera in its name and not the
+terminal's. On a new Mac without those tools, scan the code with the iPhone's Camera app, copy it,
+and use `--paste`: Universal Clipboard brings it over, and keyvault empties this Mac's clipboard
+after (copy something else on the iPhone, which keeps its own).
+None of it writes the key to a disk: it travels by pipe and FIFO into the RAM workspace. A printed
+sheet is the exception: macOS queues the page until the printer has taken it.
+
 ## The config
 
 `~/.config/keyvault/keyvault.conf` is plain bash. It names your keys and where they live, so
@@ -441,13 +454,13 @@ sandbox holds against that. Rules still stop the accidental read, which is the c
 ## Commands
 
 ```
-keyvault init | setup | edit | doctor | status | card | recovery-check
+keyvault init | setup [--print] | edit | doctor | status | card | recovery-check [--camera | --paste] [--qr]
 keyvault pack [--refresh] | list | verify | validate
 keyvault secret set NAME [--ask] [--expires D] | expires NAME D | rm NAME | backup | run NAME -- <cmd…> | list
 keyvault add <id> --file PATH | --secret | --stdin  [--level L] [--desc T] [--expires D] [--meta k=v] [--restore-to P]
 keyvault remove <id> | show <id> --out PATH
 keyvault restore [--only ID] [--force] [--apply]
-    reading commands also take --recovery (the paper key) and --via DEVICE
+    reading commands also take --recovery (the paper key; --camera/--paste read its QR code) and --via DEVICE
 
 keyvault expiring [--within DAYS] [--json] | remind [off | status]
 keyvault scan [PATH…] [--transcripts] [--json] | scan ignore <FILE:RULE:LINE | PATH>
@@ -483,7 +496,8 @@ an environment an agent can see.
 - **Bash 3.2.** That is what stock macOS ships, and the machine you are restoring onto will
   not have Homebrew yet. `keyvault` is one file for the same reason. The agent features live
   in `keyvault-access.sh`, and scan, checkup and schedule in `keyvault-watch.sh` (with
-  `keyvault-scan.py`): recovery never needs either.
+  `keyvault-scan.py`), and the QR code in `keyvault-qr.sh` (with `tools/qr-reader.swift`):
+  recovery never needs them, since the key can always be typed.
 - **Three factors, one of them on paper.** The recovery key never touches a computer, so
   stealing your passphrase or your Mac is not enough on its own.
 - **Say what you left out.** A config that records, in comments, what was considered and
